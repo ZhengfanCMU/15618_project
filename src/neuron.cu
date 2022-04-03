@@ -26,7 +26,7 @@ __global__ void column_kernel(int* weight, int* spike_time_in, int* spike_time_o
     // TODO implement multiple gamma cycles in 1 kernel launch
     
     //!< increment indicator for each synapse of each neuron
-    // if true, synapse contributes to body potential this cycle
+    //!< if true, synapse contributes to body potential this cycle
     __shared__ bool synapseRNL[blockDim.x * blockDim.y];
     // shared body potential for each neuron in a column
     __shared__ int neuronBodyPot[blockDim.y];
