@@ -1,7 +1,7 @@
 
-EXECUTABLE := cudaSaxpy
+EXECUTABLE := cudaNeuron
 
-CU_FILES   := saxpy.cu
+CU_FILES   := neuron.cu
 
 CU_DEPS    :=
 
