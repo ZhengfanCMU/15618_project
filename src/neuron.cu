@@ -8,7 +8,7 @@
 
 /**
  * @brief Simulates a synapse
- * 1 layer contains x*y columns (number of rfs after convolution with a window). Determines the number of output wire groups.
+ * 1 layer contains x*y columns (number of rfs after convolution with a kernel). Determines the number of output wire groups.
  * 1 neuron column contains numNeuronPerColumn neurons, output 1 spike on numNeuronPerColumn lines
  * each neuron has numSynapsePerNeuron synapses
  * @param[inout] weight initial synapse weight, and final updated weight array
@@ -19,9 +19,21 @@
  * @param[out]   spike_time_out output spike time (numNeuronPerColumn * numColumns * dataLength)
  *               rows*cols columns
                  numNeuronPerColumn spike lines
-                 x: spike time for each neuron (connected to synapse of next layer)
+                 x: spike time for each neuron (connected to synapse of next layer) (after 1-WTA)
+                 TODO: maybe change to k-WTA
+                 y: column ID (rows*cols)
+                 concatenate additional output data samples in the y dimension
  */
 __global__ void column_kernel(int* weight, int* spike_time_in, int* spike_time_out) {
+    // rows * columns of filtered input image
+    const int numColumns = gridDim.x * gridDim.y;
+    const int columnID = blockIdx.y * gridDim.x + blockIdx.x;
+    
+    const int numSynapsePerNeuron = blockDim.x;
+    const int numNeuronPerColumn = blockDim.y;
+    const int synapseID = threadIdx.x; //!< within a neuron
+    const int neuronID = threadIdx.y; //!< within a column
+    
     // Let each 2d thread block represent a neuron column:
     // Let each row (same threadIdx.y?) of threads represent the synapses of a neuron
     // Within each row, different threads after updating the rnl function, 1 thread update the body potential?
@@ -33,9 +45,16 @@ __global__ void column_kernel(int* weight, int* spike_time_in, int* spike_time_o
     
     //!< increment indicator for each synapse of each neuron
     //!< if true, synapse contributes to body potential this cycle
-    __shared__ bool synapseRNL[blockDim.x * blockDim.y];
+    __shared__ bool synapseRNL[numSynapsePerNeuron * numNeuronPerColumn];
     // shared body potential for each neuron in a column
-    __shared__ int neuronBodyPot[blockDim.y];
+    __shared__ int neuronBodyPot[numNeuronPerColumn];
+
+    // shared output spiketime for each neuron in a column
+    // for STDP learning
+    __shared__ int spikeTimeOutNoInhibit[numNeuronPerColumn];
+    // record the earliest spike in the column
+    int earliestSpikingNeuron;
+    int earliestSpikingTime;
 
     // 0 0 1 1 1 0 0 0
     // 0 0 0 1 1 1 1 0
@@ -50,11 +69,13 @@ __global__ void column_kernel(int* weight, int* spike_time_in, int* spike_time_o
         int incEnd = spike_time_in[/* index here*/] + weight[/* index here*/];
 
         // reset increment indicator
-        synapseRNL[threadIdx.x + blockDim.x*threadIdx.y] = false;
+        synapseRNL[synapseID + numSynapsePerNeuron * neuronID] = false;
+        // reset earliest time
+        earliestSpikingTime = gammaLength;
         
-        if (threadIdx.x == 0) {
+        if (synapseID == 0) {
             // reset body potential for this gama cycle (single dataIdx)
-            neuronBodyPot[threadIdx.y] = 0;
+            neuronBodyPot[neuronID] = 0;
             // reset spike time to gamma (no spike)
             spike_time_out[/* index here*/] = gammaLength;
         }
@@ -65,30 +86,39 @@ __global__ void column_kernel(int* weight, int* spike_time_in, int* spike_time_o
         for (int tickCycles = 0; tickCycles < gammaLength; ++tickCycles) {
             // for each synapse, check the spike_time_in to see if start spiking
             if (tickCycles >= incStart && tickCycles < incEnd) {
-                synapseRNL[threadIdx.x + blockDim.x*threadIdx.y] = true;
+                synapseRNL[synapseID + numSynapsePerNeuron * neuronID] = true;
             }
             else {
-                synapseRNL[threadIdx.x + blockDim.x*threadIdx.y] = false;
+                synapseRNL[synapseID + numSynapsePerNeuron * neuronID] = false;
             }
             __syncthreads();
             // after all RNLs are updated, 1 thread for each neuron updates the body potential
-            if (threadIdx.x == 0) {
-                // sum the synapseRNLs for each neuronBodyPot[threadIdx.y]
-                for (int synpaseIdx = 0; synpaseIdx < blockDim.x; ++synpaseIdx) {
-                    neuronBodyPot[threadIdx.y] += synapseRNL[threadIdx.x + blockDim.x*threadIdx.y];
+            if (synapseID == 0) {
+                // sum the synapseRNLs for each neuron's body potential
+                for (int synpaseIdx = 0; synpaseIdx < numSynapsePerNeuron; ++synpaseIdx) {
+                    neuronBodyPot[neuronID] += synapseRNL[synapseID + numSynapsePerNeuron * neuronID];
                 }
             }
             __syncthreads();
-            if (neuronBodyPot[threadIdx.y] >= spikeThreshold) {
-                if (threadIdx.x == 0) {
-                    spike_time_out[/* index here*/] = tickCycles;
+            if (neuronBodyPot[neuronID] >= spikeThreshold) {
+                // record the earliest spike in the column
+                if (earliestSpikingTime > tickCycles) {
+                    earliestSpikingNeuron = neuronID;
+                    earliestSpikingTime = tickCycles;
+                }
+                if (synapseID == 0) {
+                    
+                    spikeTimeOutNoInhibit[columnID + neuronID] = tickCycles;
                 }
                 break;
             }
         }
-
-
         // TODO: WTA spike time out
+        // reduce min for global spike time out
+        // TODO: thread 0 write earliestSpikingTime to output at earliestSpikingNeuron
+        // TODO: thread 0 inhibit all the later spikes
+        // remember to include dataidx in y calculation
+        
         
         // TODO: STDP and update weight
     }
@@ -100,6 +130,6 @@ void launch_column() {
     int numNeuronPerColumn = 32;
     // synapse count determined by receptive field size
     int numSynapsePerNeuron = 32;
-    column_kernel<<<dim3(rows, cols), dim3(numNeuronPerColumn, numSynapsePerNeuron)>>>();
+    column_kernel<<<dim3(rows, cols), dim3(numSynapsePerNeuron, numNeuronPerColumn)>>>();
 
 }
