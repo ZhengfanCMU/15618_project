@@ -43,15 +43,18 @@ __global__ void column_kernel(int* weight, int* spike_time_in, int* spike_time_o
     // TODO implement STDP
     // TODO implement multiple gamma cycles in 1 kernel launch
     
-    //!< increment indicator for each synapse of each neuron
-    //!< if true, synapse contributes to body potential this cycle
+    // shared within each column, for each synapse of each neuron
+    // synapse increment indicator
+    // if true, synapse contributes to body potential of neuron this cycle
     __shared__ bool synapseRNL[numSynapsePerNeuron * numNeuronPerColumn];
-    // shared body potential for each neuron in a column
-    __shared__ int neuronBodyPot[numNeuronPerColumn];
 
-    // shared output spiketime for each neuron in a column
-    // for STDP learning
+    // ===========================
+    // shared within each column, for each neuron in the column
+    // body potential of neuron
+    __shared__ int neuronBodyPot[numNeuronPerColumn];
+    // output spiketime of neuron, for STDP learning
     __shared__ int spikeTimeOutNoInhibit[numNeuronPerColumn];
+
     // record the earliest spike in the column
     int earliestSpikingNeuron;
     int earliestSpikingTime;
@@ -64,20 +67,31 @@ __global__ void column_kernel(int* weight, int* spike_time_in, int* spike_time_o
 
 
     for (int dataIdx = 0; dataIdx < dataLength; ++dataLength) {
-        // local incStart and incEnd to compare to cycle time
-        int incStart = spike_time_in[/* index here*/];
-        int incEnd = spike_time_in[/* index here*/] + weight[/* index here*/];
+        const int dataYIdx = dataIdx * numColumns + columnID;
 
+        // same synapseID share same input
+        const int inputSynapseIdx = dataYIdx * numSynapsePerNeuron + synapseID;
+        // each synapse in each neuron has its own weight, updated across data samples
+        const int columnSynapseIdx = neuronID * numSynapsePerNeuron + synapseID;
+
+        // local incStart and incEnd to compare to cycle time
+        int incStart = spike_time_in[inputSynapseIdx];
+        int incEnd = spike_time_in[inputSynapseIdx] + weight[columnSynapseIdx];
+        
         // reset increment indicator
-        synapseRNL[synapseID + numSynapsePerNeuron * neuronID] = false;
+        synapseRNL[columnSynapseIdx] = false;
         // reset earliest time
         earliestSpikingTime = gammaLength;
-        
+
+
+        // neuron corresponds to output wire
+        const int outputNeuronIdx = dataYIdx * numNeuronPerColumn + neuronID;
         if (synapseID == 0) {
             // reset body potential for this gama cycle (single dataIdx)
             neuronBodyPot[neuronID] = 0;
             // reset spike time to gamma (no spike)
-            spike_time_out[/* index here*/] = gammaLength;
+            spikeTimeOutNoInhibit[neuronID] = gammaLength;
+            spike_time_out[outputNeuronIdx] = gammaLength;
         }
         __syncthreads();
         
@@ -86,17 +100,15 @@ __global__ void column_kernel(int* weight, int* spike_time_in, int* spike_time_o
         for (int tickCycles = 0; tickCycles < gammaLength; ++tickCycles) {
             // for each synapse, check the spike_time_in to see if start spiking
             if (tickCycles >= incStart && tickCycles < incEnd) {
-                synapseRNL[synapseID + numSynapsePerNeuron * neuronID] = true;
-            }
-            else {
-                synapseRNL[synapseID + numSynapsePerNeuron * neuronID] = false;
+                synapseRNL[columnSynapseIdxnID] = true;
             }
             __syncthreads();
             // after all RNLs are updated, 1 thread for each neuron updates the body potential
             if (synapseID == 0) {
                 // sum the synapseRNLs for each neuron's body potential
+                // TODO: maybe change to binary reduction add
                 for (int synpaseIdx = 0; synpaseIdx < numSynapsePerNeuron; ++synpaseIdx) {
-                    neuronBodyPot[neuronID] += synapseRNL[synapseID + numSynapsePerNeuron * neuronID];
+                    neuronBodyPot[neuronID] += synapseRNL[neuronID * numSynapsePerNeuron + synapseIdx];
                 }
             }
             __syncthreads();
@@ -107,18 +119,19 @@ __global__ void column_kernel(int* weight, int* spike_time_in, int* spike_time_o
                     earliestSpikingTime = tickCycles;
                 }
                 if (synapseID == 0) {
-                    
-                    spikeTimeOutNoInhibit[columnID + neuronID] = tickCycles;
+                    spikeTimeOutNoInhibit[neuronID] = tickCycles;
                 }
                 break;
             }
         }
-        // TODO: WTA spike time out
+        // WTA spike time out
         // reduce min for global spike time out
-        // TODO: thread 0 write earliestSpikingTime to output at earliestSpikingNeuron
-        // TODO: thread 0 inhibit all the later spikes
+        // thread 0 write earliestSpikingTime to output at earliestSpikingNeuron
+        // all the later spikes are inhibited by default
         // remember to include dataidx in y calculation
-        
+        if (synapseID == 0) {
+            spike_time_out[dataYIdx * numNeuronPerColumn + earliestSpikingNeuron] = earliestSpikingTime;
+        }
         
         // TODO: STDP and update weight
     }
