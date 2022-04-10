@@ -5,7 +5,14 @@
 #include <driver_functions.h>
 
 #include "CycleTimer.h"
-
+struct GlobalConstants {
+    // Spike delay and weight resolution
+    int wres;
+    int rate_capture;
+    int rate_backoff;
+    int rate_search;
+};
+__constant__ GlobalConstants cuConstTNNParams;
 /**
  * @brief Simulates a synapse
  * 1 layer contains x*y columns (number of rfs after convolution with a kernel). Determines the number of output wire groups.
@@ -17,14 +24,17 @@
  *               y: column ID
  *               concatenate additional input data samples in the y dimension (additional column IDs)
  * @param[out]   spike_time_out output spike time (numNeuronPerColumn * numColumns * dataLength)
+ 
  *               rows*cols columns
                  numNeuronPerColumn spike lines
                  x: spike time for each neuron (connected to synapse of next layer) (after 1-WTA)
+                 (1-WTA, but still retaining the 0s so it can be connected to the next layer)
                  TODO: maybe change to k-WTA
                  y: column ID (rows*cols)
                  concatenate additional output data samples in the y dimension
  */
-__global__ void column_kernel(int* weight, int* spike_time_in, int* spike_time_out) {
+ //TODO: change int that are used for spike time to char
+__global__ void column_kernel(int wres, int* weight, char* spike_time_in, char* spike_time_out) {
     // rows * columns of filtered input image
     const int numColumns = gridDim.x * gridDim.y;
     const int columnID = blockIdx.y * gridDim.x + blockIdx.x;
@@ -40,24 +50,27 @@ __global__ void column_kernel(int* weight, int* spike_time_in, int* spike_time_o
     // Or use parallel reduce.
     // gamma cycle time, neuron and column dimensions in global constants
     
-    // TODO implement STDP
     // TODO implement multiple gamma cycles in 1 kernel launch
     
     // shared within each column, for each synapse of each neuron
     // synapse increment indicator
     // if true, synapse contributes to body potential of neuron this cycle
-    __shared__ bool synapseRNL[numSynapsePerNeuron * numNeuronPerColumn];
+    __shared__ bool synapseRNL_shared[numSynapsePerNeuron * numNeuronPerColumn];
+    // TODO optimize: load weight into shared mem to reduce mem access
+    //__shared__ int weight_shared[numSynapsePerNeuron * numNeuronPerColumn];
 
     // ===========================
     // shared within each column, for each neuron in the column
     // body potential of neuron
-    __shared__ int neuronBodyPot[numNeuronPerColumn];
-    // output spiketime of neuron, for STDP learning
-    __shared__ int spikeTimeOutNoInhibit[numNeuronPerColumn];
+    __shared__ int neuronBodyPot_shared[numNeuronPerColumn];
+    // output spiketime of neuron, for STDP learning (not needed)
+    //__shared__ int spikeTimeOutNoInhibit[numNeuronPerColumn];
+
+    
 
     // record the earliest spike in the column
-    int earliestSpikingNeuron;
-    int earliestSpikingTime;
+    __shared__ int earliestSpikingNeuron_shared;
+    __shared__ int earliestSpikingTime_shared;
 
     // 0 0 1 1 1 0 0 0
     // 0 0 0 1 1 1 1 0
@@ -79,70 +92,119 @@ __global__ void column_kernel(int* weight, int* spike_time_in, int* spike_time_o
         int incEnd = spike_time_in[inputSynapseIdx] + weight[columnSynapseIdx];
         
         // reset increment indicator
-        synapseRNL[columnSynapseIdx] = false;
+        synapseRNL_shared[columnSynapseIdx] = false;
         // reset earliest time
-        earliestSpikingTime = gammaLength;
-
+        if (neuronID == 0 && synapseID == 0) {
+            earliestSpikingTime_shared = gammaLength;
+        }
 
         // neuron corresponds to output wire
         const int outputNeuronIdx = dataYIdx * numNeuronPerColumn + neuronID;
         if (synapseID == 0) {
             // reset body potential for this gama cycle (single dataIdx)
-            neuronBodyPot[neuronID] = 0;
+            neuronBodyPot_shared[neuronID] = 0;
             // reset spike time to gamma (no spike)
-            spikeTimeOutNoInhibit[neuronID] = gammaLength;
+            //spikeTimeOutNoInhibit[neuronID] = gammaLength;
             spike_time_out[outputNeuronIdx] = gammaLength;
         }
         __syncthreads();
-        
+
         // end iteration when body potential reaches threshold before gamma cycle time (spikes)
         // end iteration after cycle time reaches gamma cycle time and no spike
         for (int tickCycles = 0; tickCycles < gammaLength; ++tickCycles) {
             // for each synapse, check the spike_time_in to see if start spiking
             if (tickCycles >= incStart && tickCycles < incEnd) {
-                synapseRNL[columnSynapseIdxnID] = true;
+                synapseRNL_shared[columnSynapseIdxnID] = true;
             }
             __syncthreads();
             // after all RNLs are updated, 1 thread for each neuron updates the body potential
             if (synapseID == 0) {
-                // sum the synapseRNLs for each neuron's body potential
+                // sum the synapseRNL_shareds for each neuron's body potential
                 // TODO: maybe change to binary reduction add
                 for (int synpaseIdx = 0; synpaseIdx < numSynapsePerNeuron; ++synpaseIdx) {
-                    neuronBodyPot[neuronID] += synapseRNL[neuronID * numSynapsePerNeuron + synapseIdx];
+                    neuronBodyPot_shared[neuronID] += synapseRNL_shared[neuronID * numSynapsePerNeuron + synapseIdx];
+                }
+                if (neuronBodyPot_shared[neuronID] >= spikeThreshold) {
+                    // record the earliest spike in the column
+                    // Only synapse 0 need to do this, but not adding if condition
+                    // to avoid a conditional lane mask
+                    
+                    // NOTE: We assume when multiple threads writes the same address, HW will
+                    //       sequentialize writes. This would slow down the program.
+                    // NOTE: the assumption is that if multiple neuron spike at the same time, a race doesn't matter
+                    //       but that's with the assumption that tickCycles is synced
+                    // TODO: doublecheck if possible race condition among neurons affect correctness
+                    //       e.g. if neurons are across multiple warps and they are at different tickCycles
+                    if (earliestSpikingTime_shared > tickCycles) {
+                        earliestSpikingNeuron_shared = neuronID;
+                        earliestSpikingTime_shared = tickCycles;
+                    }
                 }
             }
             __syncthreads();
-            if (neuronBodyPot[neuronID] >= spikeThreshold) {
-                // record the earliest spike in the column
-                if (earliestSpikingTime > tickCycles) {
-                    earliestSpikingNeuron = neuronID;
-                    earliestSpikingTime = tickCycles;
-                }
-                if (synapseID == 0) {
-                    spikeTimeOutNoInhibit[neuronID] = tickCycles;
-                }
+            // In case neuron reaches firing threshold in this cycle
+            if (neuronBodyPot_shared[neuronID] >= spikeThreshold) {
+                // used to test race conditions
+                assert(earliestSpikingTime_shared <= tickCycles);
                 break;
             }
         }
-        // WTA spike time out
+        // 1-WTA spike time out
         // reduce min for global spike time out
-        // thread 0 write earliestSpikingTime to output at earliestSpikingNeuron
+        // thread 0 write earliestSpikingTime_shared to output at earliestSpikingNeuron_shared
         // all the later spikes are inhibited by default
-        // remember to include dataidx in y calculation
-        if (synapseID == 0) {
-            spike_time_out[dataYIdx * numNeuronPerColumn + earliestSpikingNeuron] = earliestSpikingTime;
+        if (synapseID == 0 && neuronID == earliestSpikingNeuron_shared) {
+            spike_time_out[dataYIdx * numNeuronPerColumn + earliestSpikingNeuron_shared] = earliestSpikingTime_shared;
         }
         
-        // TODO: STDP and update weight
-    }
+        // STDP and update weight
+        // TODO: define constant parameters: rate_capture, rate_backoff, rate_search
+        // per synapse operation
 
+        // weightOverHalf
+        // inLeOut
+        // inNotInfty
+        // outNotInfty
+        // inOutNotInfty
+        bool isCausal = spike_time_in[inputSynapseIdx] <= spike_time_out[outputNeuronIdx];
+        bool inHasSpike = spike_time_in[inputSynapseIdx] < gammaLength;
+        bool outHasSpike = spike_time_out[outputNeuronIdx] < gammaLength;
+        bool isCapture = inHasSpike && outHasSpike && isCausal;
+        bool isBackoff = (inHasSpike && outHasSpike && !isCausal) ||
+                         (!inHasSpike && outHasSpike);
+        bool isSearch = inHasSpike && !outHasSpike;
+        //  w_max = gammaLength - 1
+        // since integral comparison, not doing -1 on gammaLength
+        bool weightOverHalf = weight[columnSynapseIdx] >= gammaLength / 2;
+        int stabUp = weightOverHalf ? rate_capture : rate_capture / 2;
+        int stabDown = !weightOverHalf ? rate_backoff : rate_backoff / 2;
+        if (isCapture) weight += rate_capture * stabUp;
+        else if (isBackoff) weight += rate_backoff * stabDown;
+        else if (isSearch) weight += rate_search;
+    }
 }
 
-void launch_column() {
+// unroll and convert MNIST data into spike_time_in array
+/**
+ * @brief unroll and convert MNIST data into spike_time_in array
+ * 
+ * @param cuMNISTdata MNIST data file loaded into cuda memory
+ * @param spike_time_in input spike time array to TNN layer in cuda memory
+ */
+__global__ void MNIST_loader_kernel(char * cuMNISTdata, char * spike_time_in) {
+    // sampleStart
+    // numSamplesToConvert
+    // rfsize
+    // stride
+    // channels/format determined by kernel itself
+}
+
+void launch_column(std::string input_file, std::string output_file) {
     // neuron count determined by number of classes at current layer
-    int numNeuronPerColumn = 32;
+    int numNeuronPerColumn = 12;
     // synapse count determined by receptive field size
-    int numSynapsePerNeuron = 32;
-    column_kernel<<<dim3(rows, cols), dim3(numSynapsePerNeuron, numNeuronPerColumn)>>>();
+    //int numSynapsePerNeuron = rfsize * rfsize * chanleng;
+    // rows and cols is the number of receptive fields
+    //column_kernel<<<dim3(rows, cols), dim3(numSynapsePerNeuron, numNeuronPerColumn)>>>();
 
 }
