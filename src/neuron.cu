@@ -3,6 +3,7 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <driver_functions.h>
+#include <string>
 
 #include "CycleTimer.h"
 struct GlobalConstants {
@@ -11,6 +12,8 @@ struct GlobalConstants {
     int rate_capture;
     int rate_backoff;
     int rate_search;
+    int gammaLength;
+    int spikeThreshold;
 };
 __constant__ GlobalConstants cuConstTNNParams;
 /**
@@ -34,7 +37,7 @@ __constant__ GlobalConstants cuConstTNNParams;
                  concatenate additional output data samples in the y dimension
  */
  //TODO: change int that are used for spike time to char
-__global__ void column_kernel(int wres, int* weight, char* spike_time_in, char* spike_time_out) {
+__global__ void column_kernel(int wres, int* weight, char* spike_time_in, char* spike_time_out, int dataLength) {
     // rows * columns of filtered input image
     const int numColumns = gridDim.x * gridDim.y;
     const int columnID = blockIdx.y * gridDim.x + blockIdx.x;
@@ -95,7 +98,7 @@ __global__ void column_kernel(int wres, int* weight, char* spike_time_in, char* 
         synapseRNL_shared[columnSynapseIdx] = false;
         // reset earliest time
         if (neuronID == 0 && synapseID == 0) {
-            earliestSpikingTime_shared = gammaLength;
+            earliestSpikingTime_shared = cuConstTNNParams.gammaLength;
         }
 
         // neuron corresponds to output wire
@@ -105,26 +108,26 @@ __global__ void column_kernel(int wres, int* weight, char* spike_time_in, char* 
             neuronBodyPot_shared[neuronID] = 0;
             // reset spike time to gamma (no spike)
             //spikeTimeOutNoInhibit[neuronID] = gammaLength;
-            spike_time_out[outputNeuronIdx] = gammaLength;
+            spike_time_out[outputNeuronIdx] = cuConstTNNParams.gammaLength;
         }
         __syncthreads();
 
         // end iteration when body potential reaches threshold before gamma cycle time (spikes)
         // end iteration after cycle time reaches gamma cycle time and no spike
-        for (int tickCycles = 0; tickCycles < gammaLength; ++tickCycles) {
+        for (int tickCycles = 0; tickCycles < cuConstTNNParams.gammaLength; ++tickCycles) {
             // for each synapse, check the spike_time_in to see if start spiking
             if (tickCycles >= incStart && tickCycles < incEnd) {
-                synapseRNL_shared[columnSynapseIdxnID] = true;
+                synapseRNL_shared[columnSynapseIdx] = true;
             }
             __syncthreads();
             // after all RNLs are updated, 1 thread for each neuron updates the body potential
             if (synapseID == 0) {
                 // sum the synapseRNL_shareds for each neuron's body potential
                 // TODO: maybe change to binary reduction add
-                for (int synpaseIdx = 0; synpaseIdx < numSynapsePerNeuron; ++synpaseIdx) {
+                for (int synapseIdx = 0; synapseIdx < numSynapsePerNeuron; ++synapseIdx) {
                     neuronBodyPot_shared[neuronID] += synapseRNL_shared[neuronID * numSynapsePerNeuron + synapseIdx];
                 }
-                if (neuronBodyPot_shared[neuronID] >= spikeThreshold) {
+                if (neuronBodyPot_shared[neuronID] >= cuConstTNNParams.spikeThreshold) {
                     // record the earliest spike in the column
                     // Only synapse 0 need to do this, but not adding if condition
                     // to avoid a conditional lane mask
@@ -143,7 +146,7 @@ __global__ void column_kernel(int wres, int* weight, char* spike_time_in, char* 
             }
             __syncthreads();
             // In case neuron reaches firing threshold in this cycle
-            if (neuronBodyPot_shared[neuronID] >= spikeThreshold) {
+            if (neuronBodyPot_shared[neuronID] >= cuConstTNNParams.spikeThreshold) {
                 // used to test race conditions
                 assert(earliestSpikingTime_shared <= tickCycles);
                 break;
@@ -167,20 +170,20 @@ __global__ void column_kernel(int wres, int* weight, char* spike_time_in, char* 
         // outNotInfty
         // inOutNotInfty
         bool isCausal = spike_time_in[inputSynapseIdx] <= spike_time_out[outputNeuronIdx];
-        bool inHasSpike = spike_time_in[inputSynapseIdx] < gammaLength;
-        bool outHasSpike = spike_time_out[outputNeuronIdx] < gammaLength;
+        bool inHasSpike = spike_time_in[inputSynapseIdx] < cuConstTNNParams.gammaLength;
+        bool outHasSpike = spike_time_out[outputNeuronIdx] < cuConstTNNParams.gammaLength;
         bool isCapture = inHasSpike && outHasSpike && isCausal;
         bool isBackoff = (inHasSpike && outHasSpike && !isCausal) ||
                          (!inHasSpike && outHasSpike);
         bool isSearch = inHasSpike && !outHasSpike;
         //  w_max = gammaLength - 1
         // since integral comparison, not doing -1 on gammaLength
-        bool weightOverHalf = weight[columnSynapseIdx] >= gammaLength / 2;
-        int stabUp = weightOverHalf ? rate_capture : rate_capture / 2;
-        int stabDown = !weightOverHalf ? rate_backoff : rate_backoff / 2;
-        if (isCapture) weight += rate_capture * stabUp;
-        else if (isBackoff) weight += rate_backoff * stabDown;
-        else if (isSearch) weight += rate_search;
+        bool weightOverHalf = weight[columnSynapseIdx] >= cuConstTNNParams.gammaLength / 2;
+        int stabUp = weightOverHalf ? cuConstTNNParams.rate_capture : cuConstTNNParams.rate_capture / 2;
+        int stabDown = !weightOverHalf ? cuConstTNNParams.rate_backoff : cuConstTNNParams.rate_backoff / 2;
+        if (isCapture) weight += cuConstTNNParams.rate_capture * stabUp;
+        else if (isBackoff) weight += cuConstTNNParams.rate_backoff * stabDown;
+        else if (isSearch) weight += cuConstTNNParams.rate_search;
     }
 }
 
@@ -188,8 +191,8 @@ __global__ void column_kernel(int wres, int* weight, char* spike_time_in, char* 
 /**
  * @brief unroll and convert MNIST data into spike_time_in array
  * 
- * @param cuMNISTdata MNIST data file loaded into cuda memory
- * @param spike_time_in input spike time array to TNN layer in cuda memory
+ * @param[in] cuMNISTdata MNIST data file loaded into cuda memory
+ * @param[out] spike_time_in input spike time array to TNN layer in cuda memory
  */
 __global__ void MNIST_loader_kernel(char * cuMNISTdata, char * spike_time_in) {
     // sampleStart
