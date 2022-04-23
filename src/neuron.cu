@@ -4,6 +4,7 @@
 #include <cuda_runtime.h>
 #include <driver_functions.h>
 #include <string>
+#include <arpa/inet.h>
 
 #include "CycleTimer.h"
 struct GlobalConstants {
@@ -223,19 +224,48 @@ void setup() {
     // TODO: fill in params
     cudaMemcpyToSymbol(cuConstTNNParams, &params, sizeof(GlobalConstants));
 }
+
 // unroll and convert MNIST data into spike_time_in array
+
 /**
- * @brief unroll and convert MNIST data into spike_time_in array
- * 
+ * @brief unroll and convert MNIST data into spike_time_in array, using pos-neg encoding.
+ *        Pos: if pixel greater/brigher than threshold, spike at time 0,
+ *             otherwise spike at time gammaLength.
+ *        Neg: if pixel less/darker than threshold, spike at time 0,
+ *             otherwise spike at time gammaLength.
+ *        For MNIST, there are n imgs, each img is 28x28, we want to generate
+ *        2 channels for each img. Each block is used to load 1 img, and each
+ *        thread within a block is used to process 1 input pixel. So each block
+ *        needs to have 28x28 threads, each thread generate 2 pixels.
+ * @param[in] pnThreshold Threshold to determine if a pixel should be pos or neg.
  * @param[in] cuMNISTdata MNIST data file loaded into cuda memory
  * @param[out] spike_time_in input spike time array to TNN layer in cuda memory
  */
-__global__ void MNIST_loader_kernel(char * cuMNISTdata, char * spike_time_in) {
+__global__ void MNIST_loader_kernel(const int pnThreshold, char * cuMNISTdata, char * spike_time_in) {
     // sampleStart
     // numSamplesToConvert
     // rfsize
     // stride
     // channels/format determined by kernel itself
+
+    const int gammaLength = 1 << cuConstTNNParams.wres;
+    const int imgIdx = blockIdx.x;
+    const int imgDimX = blockDim.x;
+    const int imgDimY = blockDim.y;
+    const int pixelX = threadIdx.x;
+    const int pixelY = threadIdx.y;
+    const int dataIdx = imgDimX * imgDimY * imgIdx + imgDimX * pixelY + pixelX;
+    const int posSpikeIdx = dataIdx * 2;
+    const int negSpikeIdx = dataIdx * 2 + 1;
+
+    spike_time_in[posSpikeIdx] = cuMNISTdata[dataIdx] < pnThreshold ? 0 : gammaLength;
+    spike_time_in[negSpikeIdx] = cuMNISTdata[dataIdx] >= pnThreshold ? 0 : gammaLength;
+}
+
+bool assertAtFileEnd(FILE * file) {
+    int unused;
+    int elemRead = fread(&unused, 1, 1, file);
+    return elemRead == 0 && feof(file);
 }
 /**
  * @brief 
@@ -243,11 +273,74 @@ __global__ void MNIST_loader_kernel(char * cuMNISTdata, char * spike_time_in) {
  * @param[in] input_file 
  * @param[out] spike_time_in 
  */
-void load_MNIST(std::string input_file, int dataLength, char* spike_time_in) {
+void load_MNIST(const char* image_input_file, const char* label_input_file, int dataLength, char* spike_time_in, char* labels) {
+    const uint32_t IDX3_MAGIC = 0x803;
+    const uint32_t IDX1_MAGIC = 0x801;
     // Load input MNIST dataset and cudaMemcpy
     // CudaMalloc spike_time_in and spike_time_out
     // MNIST_loader_kernel
-    FILE * mnistFile = fopen(input_file.c_str(), "r");
+    FILE * mnistImageFile = fopen(image_input_file, "r");
+    assert(mnistImageFile != NULL);
+    FILE * mnistLabelFile = fopen(label_input_file, "r");
+    assert(mnistLabelFile != NULL);
+
+    // Read image data
+    int32_t magic, dims3[3];
+    size_t elemRead = fread(&magic, sizeof(uint32_t), 1, mnistImageFile);
+    assert(elemRead == 1);
+    // MNIST dataset is big endian for the int32s
+    magic = ntohl(magic); // network order to host order long
+    assert(magic == IDX3_MAGIC);
+
+    elemRead = fread(&dims3, sizeof(uint32_t), 3, mnistImageFile);
+    assert(elemRead == 3);
+    for(int i = 0; i < 3; ++i) {
+        dims3[i] = ntohl(dims3[i]);
+    }
+    int32_t & nImgs = dims3[0];
+    int32_t & nRows = dims3[1];
+    int32_t & nCols = dims3[2];
+    assert(nRows == nCols && nCols == 28);
+
+    int nImageBytes = nImgs * nRows * nCols; // Each pixel has 1 byte.
+    uint8_t* imgData = (uint8_t*) malloc(nImageBytes);
+    elemRead = fread(&imgData, sizeof(uint8_t), nImageBytes, mnistImageFile);
+    assert(elemRead == nImageBytes);
+    assert(assertAtFileEnd(mnistImageFile));
+    fclose(mnistImageFile);
+
+    // copy pixel data to device
+    char* imgData_device = NULL;
+    cudaError_t cuerr = cudaMalloc(&imgData_device, nImageBytes);
+    assert(cuerr == cudaSuccess);
+    cuerr = cudaMemcpy(imgData_device, imgData, nImageBytes, cudaMemcpyHostToDevice);
+    assert(cuerr == cudaSuccess);
+    free(imgData);
+
+    // launch kernel to convert to spike time
+    MNIST_loader_kernel<<<nImgs, dim3(nRows, nCols)>>>(UINT8_MAX/2, imgData_device, spike_time_in);
+    
+
+    // Read label data into device memory as well for later classification
+    elemRead = fread(&magic, sizeof(uint32_t), 1, mnistLabelFile);
+    assert(elemRead == 1);
+    magic = ntohl(magic);
+    assert(magic == IDX1_MAGIC);
+    
+    int nLabels;
+    elemRead = fread(&nLabels, sizeof(uint32_t), 1, mnistLabelFile);
+    assert(elemRead == 1);
+    nLabels = ntohl(nLabels);
+
+    uint8_t * labelData = (uint8_t *)malloc(nLabels);
+    elemRead = fread(labelData, 1, nLabels, mnistLabelFile);
+    assert(elemRead == nLabels);
+    assert(assertAtFileEnd(mnistLabelFile));
+    fclose(mnistLabelFile);
+
+    cuerr = cudaMemcpy(labels, labelData, nLabels, cudaMemcpyHostToDevice);
+    assert(cuerr == cudaSuccess);
+    free(labelData);
 }
 
 /**
