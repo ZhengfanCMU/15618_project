@@ -4,24 +4,85 @@
 #include <cuda_runtime.h>
 #include <driver_functions.h>
 #include <string>
-#include <arpa/inet.h>
+
+#include <cassert>
 
 #include "CycleTimer.h"
+#include "neuron.h"
+
 struct GlobalConstants {
-    // Spike delay and weight resolution
+    // Spike delay and weights resolution
     int wres;
-    int rate_capture;
-    int rate_backoff;
-    int rate_search;
+    float rate_capture;
+    float rate_backoff;
+    float rate_search;
     int spikeThreshold;
 };
 __constant__ GlobalConstants cuConstTNNParams;
+// unroll and convert MNIST data into spike_time_in array
+
+/**
+ * @brief unroll and convert MNIST data into spike_time_in array, using pos-neg encoding.
+ *        Pos: if pixel greater/brigher than threshold, spike at time 0,
+ *             otherwise spike at time gammaLength.
+ *        Neg: if pixel less/darker than threshold, spike at time 0,
+ *             otherwise spike at time gammaLength.
+ *        For MNIST, there are n imgs, each img is 28x28, we want to generate
+ *        2 channels for each img. Each block is used to load 1 img, and each
+ *        thread within a block is used to process 1 input pixel. So each block
+ *        needs to have 28x28 threads, each thread generate 2 pixels.
+ * @param[in] pnThreshold Threshold to determine if a pixel should be pos or neg.
+ * @param[in] cuMNISTdata MNIST data file loaded into cuda memory
+ * @param[out] spike_time_in input spike time array to TNN layer in cuda memory
+ */
+__global__ void MNIST_loader_kernel(const int pnThreshold, char * cuMNISTdata, char * spike_time_in) {
+    // sampleStart
+    // numSamplesToConvert
+    // rfsize
+    // stride
+    // channels/format determined by kernel itself
+
+    const int gammaLength = 1 << cuConstTNNParams.wres;
+    const int imgIdx = blockIdx.x;
+    const int imgDimX = blockDim.x;
+    const int imgDimY = blockDim.y;
+    const int pixelX = threadIdx.x;
+    const int pixelY = threadIdx.y;
+    const int dataIdx = imgDimX * imgDimY * imgIdx + imgDimX * pixelY + pixelX;
+    const int posSpikeIdx = dataIdx * 2;
+    const int negSpikeIdx = dataIdx * 2 + 1;
+
+    spike_time_in[posSpikeIdx] = cuMNISTdata[dataIdx] < pnThreshold ? 0 : gammaLength;
+    spike_time_in[negSpikeIdx] = cuMNISTdata[dataIdx] >= pnThreshold ? 0 : gammaLength;
+}
+
+
+void launch_load_MNIST(int nImgs, int nRows, int nCols, uint8_t* imgData, char* & spike_time_in) {
+    // copy raw MNIST to device
+    int nImageBytes = nImgs * nRows * nCols; // Each pixel is 1 byte.
+    char* imgData_device = NULL;
+    cudaError_t cuerr = cudaMalloc(&imgData_device, nImageBytes);
+    assert(cuerr == cudaSuccess);
+    cuerr = cudaMemcpy(imgData_device, imgData, nImageBytes, cudaMemcpyHostToDevice);
+    assert(cuerr == cudaSuccess);
+    int nChan = 2;
+    cuerr = cudaMalloc(&spike_time_in, nImageBytes * nChan);
+    assert(cuerr == cudaSuccess);
+    // launch kernel to convert to spike time
+    MNIST_loader_kernel<<<nImgs, dim3(nRows, nCols)>>>(UINT8_MAX/2, imgData_device, spike_time_in);
+}
+void copyLabelToDevice(int nLabels, uint8_t * labelData, char *& labels) {
+    cudaError_t cuerr = cudaMalloc(&labels, nLabels);
+    assert(cuerr == cudaSuccess);
+    cuerr = cudaMemcpy(labels, labelData, nLabels, cudaMemcpyHostToDevice);
+    assert(cuerr == cudaSuccess);
+}
 /**
  * @brief Simulates a synapse
  * 1 layer contains x*y columns (number of rfs after convolution with a kernel). Determines the number of output wire groups.
  * 1 neuron column contains numNeuronPerColumn neurons, output 1 spike on numNeuronPerColumn lines
  * each neuron has numSynapsePerNeuron synapses
- * @param[inout] weight initial synapse weight, and final updated weight array
+ * @param[inout] weights initial synapse weights, and final updated weights array
  * @param[in]    spike_time_in matrix of input spike times
  *              (img_x, img_y: pixel's position in the img)
                 (nchannels * img_width) * img_height * dataLength
@@ -45,8 +106,7 @@ __constant__ GlobalConstants cuConstTNNParams;
                 TODO: maybe change to k-WTA
  * @param[in]    dataLength number of images in the input and output
  */
- //TODO: change int that are used for spike time to char
-__global__ void column_kernel(int* weight, char* spike_time_in, char* spike_time_out, int dataLength) {
+__global__ void column_kernel(float* weights, char* spike_time_in, char* spike_time_out, int dataLength) {
     // rows * columns of output spike times
     const int numColumns = gridDim.x * gridDim.y;
     const int columnID = blockIdx.y * gridDim.x + blockIdx.x; // for output
@@ -67,7 +127,10 @@ __global__ void column_kernel(int* weight, char* spike_time_in, char* spike_time
     
     const int neuronID = threadIdx.x; //!< within a column
     const int synapseID = threadIdx.y * blockDim.z + threadIdx.z; //!< within a neuron
-    
+    // each synapse in each neuron has its own weights, updated across data samples
+    const int columnSynapseIdx = neuronID * numSynapsePerNeuron + synapseID;
+    const int layerSynapseIdx = numNeuronPerColumn * numSynapsePerNeuron * columnID + columnSynapseIdx;
+
     const int rfXIdx = threadIdx.z / nChan;
     const int chanID = threadIdx.z % nChan;
     const int rfYIdx = threadIdx.y;
@@ -82,8 +145,10 @@ __global__ void column_kernel(int* weight, char* spike_time_in, char* spike_time
     const int spikeTimeInputX = blockIdx.x + rfXIdx;
     const int spikeTimeInputY = blockIdx.y + rfYIdx;
 
-    const int inputImgSizeX = gridDim.x + rfSize/2 + rfSize/2;
-    const int inputImgSizeY = gridDim.y + rfSize/2 + rfSize/2;
+    // TODO: for stride 1 only, if supporting other strides, 
+    // change this calculation/pass in input size as params
+    const int inputImgSizeX = gridDim.x + rfSize - 1;
+    const int inputImgSizeY = gridDim.y + rfSize - 1;
     const int numInputPixels = inputImgSizeX * inputImgSizeY;
     const int inputPixelIdx = spikeTimeInputY * inputImgSizeX + spikeTimeInputX;
 
@@ -95,14 +160,15 @@ __global__ void column_kernel(int* weight, char* spike_time_in, char* spike_time
     // ==== Shared within each column, for each synapse of each neuron
     // synapse increment indicator
     // if true, synapse contributes to body potential of neuron this cycle
-    __shared__ bool synapseRNL_shared[numSynapsePerNeuron * numNeuronPerColumn];
-    // TODO optimize: load weight into shared mem to reduce mem access
-    //__shared__ int weight_shared[numSynapsePerNeuron * numNeuronPerColumn];
+    //__shared__ bool synapseRNL_shared[numSynapsePerNeuron * numNeuronPerColumn];
+    // TODO optimize: load weights into shared mem to reduce mem access
+    //__shared__ int weights_shared[numSynapsePerNeuron * numNeuronPerColumn];
 
     // ===========================
     // shared within each column, for each neuron in the column
     // body potential of neuron
-    __shared__ int neuronBodyPot_shared[numNeuronPerColumn];
+    //__shared__ int neuronBodyPot_shared[numNeuronPerColumn];
+
     // output spiketime of neuron, for STDP learning (not needed)
     // may need for k-WTA
     //__shared__ int spikeTimeOutNoInhibit[numNeuronPerColumn];
@@ -111,8 +177,14 @@ __global__ void column_kernel(int* weight, char* spike_time_in, char* spike_time
 
     // record the earliest spike in the column
     // might use an array of these for k-WTA
-    __shared__ int earliestSpikingNeuron_shared;
-    __shared__ int earliestSpikingTime_shared;
+    // __shared__ int earliestSpikingNeuron_shared;
+    // __shared__ int earliestSpikingTime_shared;
+    // int totalSharedSize = sizeof(int) * numNeuronPerColumn + sizeof(int)*2 + sizeof(bool) * numSynapsePerNeuron * numNeuronPerColumn;
+    extern __shared__ uint8_t _AllShared[];
+    bool * const& synapseRNL_shared = (bool*) &_AllShared[sizeof(int) * numNeuronPerColumn + sizeof(int)*2];
+    int * const& neuronBodyPot_shared = (int*) &_AllShared[2];
+    int & earliestSpikingNeuron_shared = *((int*) &_AllShared[0]);
+    int & earliestSpikingTime_shared = *((int*) &_AllShared[1]);
 
     // 0 0 1 1 1 0 0 0
     // 0 0 0 1 1 1 1 0
@@ -120,6 +192,10 @@ __global__ void column_kernel(int* weight, char* spike_time_in, char* spike_time
 
     // 0 1 3 5 
 
+    // Initialize all the weights
+    // half initialization for now
+    weights[layerSynapseIdx] = (gammaLength - 1.) / 2;
+    // TODO implement a choice of random initialization
 
     for (int dataIdx = 0; dataIdx < dataLength; ++dataLength) {
         // TODO change this to consider potential convolution
@@ -127,12 +203,11 @@ __global__ void column_kernel(int* weight, char* spike_time_in, char* spike_time
         const int dataPixelIdx = dataIdx * numInputPixels + inputPixelIdx;
         const int inputSpikeIdx = dataPixelIdx * nChan + chanID;
 
-        // each synapse in each neuron has its own weight, updated across data samples
-        const int columnSynapseIdx = neuronID * numSynapsePerNeuron + synapseID;
+        
         
         // local incStart and incEnd to compare to cycle time
         int incStart = spike_time_in[inputSpikeIdx];
-        int incEnd = spike_time_in[inputSpikeIdx] + weight[columnSynapseIdx];
+        int incEnd = spike_time_in[inputSpikeIdx] + weights[layerSynapseIdx];
         
         // reset increment indicator
         synapseRNL_shared[columnSynapseIdx] = false;
@@ -201,7 +276,7 @@ __global__ void column_kernel(int* weight, char* spike_time_in, char* spike_time
             spike_time_out[outputDataPixelIdx * numNeuronPerColumn + earliestSpikingNeuron_shared] = earliestSpikingTime_shared;
         }
         
-        // STDP and update weight
+        // STDP and update weights
         bool isCausal = spike_time_in[inputSpikeIdx] <= spike_time_out[outputNeuronIdx];
         bool inHasSpike = spike_time_in[inputSpikeIdx] < gammaLength;
         bool outHasSpike = spike_time_out[outputNeuronIdx] < gammaLength;
@@ -210,138 +285,32 @@ __global__ void column_kernel(int* weight, char* spike_time_in, char* spike_time
                          (!inHasSpike && outHasSpike);
         bool isSearch = inHasSpike && !outHasSpike;
         //  w_max = gammaLength - 1
-        // since integral comparison, not doing -1 on gammaLength
-        bool weightOverHalf = weight[columnSynapseIdx] >= gammaLength / 2;
-        int stabUp = weightOverHalf ? cuConstTNNParams.rate_capture : cuConstTNNParams.rate_capture / 2;
-        int stabDown = !weightOverHalf ? cuConstTNNParams.rate_backoff : cuConstTNNParams.rate_backoff / 2;
-        if (isCapture) weight += cuConstTNNParams.rate_capture * stabUp;
-        else if (isBackoff) weight -= cuConstTNNParams.rate_backoff * stabDown;
-        else if (isSearch) weight += cuConstTNNParams.rate_search;
+        bool weightOverHalf = weights[layerSynapseIdx] >= (gammaLength - 1.) / 2.;
+        float stabUp = weightOverHalf ? cuConstTNNParams.rate_capture : (cuConstTNNParams.rate_capture / 2.);
+        float stabDown = !weightOverHalf ? cuConstTNNParams.rate_backoff : (cuConstTNNParams.rate_backoff / 2.);
+        if (isCapture) weights[layerSynapseIdx] += cuConstTNNParams.rate_capture * stabUp;
+        else if (isBackoff) weights[layerSynapseIdx] -= cuConstTNNParams.rate_backoff * stabDown;
+        else if (isSearch) weights[layerSynapseIdx] += cuConstTNNParams.rate_search;
+        // Clamp weights between 0 and gammalength - 1
+        weights[layerSynapseIdx] = weights[layerSynapseIdx] < 0. ? 0. : weights[layerSynapseIdx];
+        weights[layerSynapseIdx] = weights[layerSynapseIdx] > (gammaLength - 1.) ? (gammaLength - 1.) : weights[layerSynapseIdx];
     }
 }
+
 void setup() {
     GlobalConstants params;
-    // TODO: fill in params
-    cudaMemcpyToSymbol(cuConstTNNParams, &params, sizeof(GlobalConstants));
+
+    // Fill in params
+    params.wres = 3;
+    params.rate_capture = 1./2.;
+    params.rate_backoff = 1./1024.;
+    params.rate_search = 1./2.;
+    params.spikeThreshold = 4;
+
+    cudaMemcpyToSymbol(&cuConstTNNParams, &params, sizeof(GlobalConstants));
 }
 
-// unroll and convert MNIST data into spike_time_in array
 
-/**
- * @brief unroll and convert MNIST data into spike_time_in array, using pos-neg encoding.
- *        Pos: if pixel greater/brigher than threshold, spike at time 0,
- *             otherwise spike at time gammaLength.
- *        Neg: if pixel less/darker than threshold, spike at time 0,
- *             otherwise spike at time gammaLength.
- *        For MNIST, there are n imgs, each img is 28x28, we want to generate
- *        2 channels for each img. Each block is used to load 1 img, and each
- *        thread within a block is used to process 1 input pixel. So each block
- *        needs to have 28x28 threads, each thread generate 2 pixels.
- * @param[in] pnThreshold Threshold to determine if a pixel should be pos or neg.
- * @param[in] cuMNISTdata MNIST data file loaded into cuda memory
- * @param[out] spike_time_in input spike time array to TNN layer in cuda memory
- */
-__global__ void MNIST_loader_kernel(const int pnThreshold, char * cuMNISTdata, char * spike_time_in) {
-    // sampleStart
-    // numSamplesToConvert
-    // rfsize
-    // stride
-    // channels/format determined by kernel itself
-
-    const int gammaLength = 1 << cuConstTNNParams.wres;
-    const int imgIdx = blockIdx.x;
-    const int imgDimX = blockDim.x;
-    const int imgDimY = blockDim.y;
-    const int pixelX = threadIdx.x;
-    const int pixelY = threadIdx.y;
-    const int dataIdx = imgDimX * imgDimY * imgIdx + imgDimX * pixelY + pixelX;
-    const int posSpikeIdx = dataIdx * 2;
-    const int negSpikeIdx = dataIdx * 2 + 1;
-
-    spike_time_in[posSpikeIdx] = cuMNISTdata[dataIdx] < pnThreshold ? 0 : gammaLength;
-    spike_time_in[negSpikeIdx] = cuMNISTdata[dataIdx] >= pnThreshold ? 0 : gammaLength;
-}
-
-bool assertAtFileEnd(FILE * file) {
-    int unused;
-    int elemRead = fread(&unused, 1, 1, file);
-    return elemRead == 0 && feof(file);
-}
-/**
- * @brief 
- * 
- * @param[in] input_file 
- * @param[out] spike_time_in 
- */
-void load_MNIST(const char* image_input_file, const char* label_input_file, int dataLength, char* spike_time_in, char* labels) {
-    const uint32_t IDX3_MAGIC = 0x803;
-    const uint32_t IDX1_MAGIC = 0x801;
-    // Load input MNIST dataset and cudaMemcpy
-    // CudaMalloc spike_time_in and spike_time_out
-    // MNIST_loader_kernel
-    FILE * mnistImageFile = fopen(image_input_file, "r");
-    assert(mnistImageFile != NULL);
-    FILE * mnistLabelFile = fopen(label_input_file, "r");
-    assert(mnistLabelFile != NULL);
-
-    // Read image data
-    int32_t magic, dims3[3];
-    size_t elemRead = fread(&magic, sizeof(uint32_t), 1, mnistImageFile);
-    assert(elemRead == 1);
-    // MNIST dataset is big endian for the int32s
-    magic = ntohl(magic); // network order to host order long
-    assert(magic == IDX3_MAGIC);
-
-    elemRead = fread(&dims3, sizeof(uint32_t), 3, mnistImageFile);
-    assert(elemRead == 3);
-    for(int i = 0; i < 3; ++i) {
-        dims3[i] = ntohl(dims3[i]);
-    }
-    int32_t & nImgs = dims3[0];
-    int32_t & nRows = dims3[1];
-    int32_t & nCols = dims3[2];
-    assert(nRows == nCols && nCols == 28);
-
-    int nImageBytes = nImgs * nRows * nCols; // Each pixel has 1 byte.
-    uint8_t* imgData = (uint8_t*) malloc(nImageBytes);
-    elemRead = fread(&imgData, sizeof(uint8_t), nImageBytes, mnistImageFile);
-    assert(elemRead == nImageBytes);
-    assert(assertAtFileEnd(mnistImageFile));
-    fclose(mnistImageFile);
-
-    // copy pixel data to device
-    char* imgData_device = NULL;
-    cudaError_t cuerr = cudaMalloc(&imgData_device, nImageBytes);
-    assert(cuerr == cudaSuccess);
-    cuerr = cudaMemcpy(imgData_device, imgData, nImageBytes, cudaMemcpyHostToDevice);
-    assert(cuerr == cudaSuccess);
-    free(imgData);
-
-    // launch kernel to convert to spike time
-    MNIST_loader_kernel<<<nImgs, dim3(nRows, nCols)>>>(UINT8_MAX/2, imgData_device, spike_time_in);
-    
-
-    // Read label data into device memory as well for later classification
-    elemRead = fread(&magic, sizeof(uint32_t), 1, mnistLabelFile);
-    assert(elemRead == 1);
-    magic = ntohl(magic);
-    assert(magic == IDX1_MAGIC);
-    
-    int nLabels;
-    elemRead = fread(&nLabels, sizeof(uint32_t), 1, mnistLabelFile);
-    assert(elemRead == 1);
-    nLabels = ntohl(nLabels);
-
-    uint8_t * labelData = (uint8_t *)malloc(nLabels);
-    elemRead = fread(labelData, 1, nLabels, mnistLabelFile);
-    assert(elemRead == nLabels);
-    assert(assertAtFileEnd(mnistLabelFile));
-    fclose(mnistLabelFile);
-
-    cuerr = cudaMemcpy(labels, labelData, nLabels, cudaMemcpyHostToDevice);
-    assert(cuerr == cudaSuccess);
-    free(labelData);
-}
 
 /**
  * @brief 
@@ -350,40 +319,102 @@ void load_MNIST(const char* image_input_file, const char* label_input_file, int 
  * @param[in] dataLength how many sets are in there
  * @param[out] spike_time_out array for output spike time data (device pointer)
  */
-void launch_column(char* spike_time_in, int dataLength, char* spike_time_out) {
+void launch_column(layerParams& params, int dataLength, char* spike_time_in) {
+    assert(params.stride == 1);
+    params.outputDim = (params.inputDim - params.rfsize)/params.stride + 1;
     
+    params.nSynapsesPerNeuron = params.rfsize * params.rfsize * params.nPrevChan;
     
-    // neuron count determined by number of classes at current layer
-    int numNeuronPerColumn = 12;
-    // synapse count determined by receptive field size
-    //int numSynapsePerNeuron = rfsize * rfsize * chanleng;
-    // rows and cols is the number of receptive fields
-    //column_kernel<<<dim3(rows, cols), dim3(numNeuronPerColumn, rfsize, )>>>();
-
+    // weights are initialized in the kernel
+    cudaMalloc(&params.weights, sizeof(float) * params.nSynapsesPerNeuron 
+                                            * params.nNeurons 
+                                            * params.outputDim * params.outputDim);
+    
+    cudaMalloc(&params.spike_time_out, sizeof(char) * params.nNeurons * params.outputDim * params.outputDim * dataLength);
+    int totalSharedSize = sizeof(int) * params.nNeurons + sizeof(int)*2 + sizeof(bool) * params.nSynapsesPerNeuron * params.nNeurons;
+    column_kernel<<<dim3(params.outputDim, params.outputDim), 
+                    dim3(params.nNeurons, 
+                         params.rfsize, 
+                         params.rfsize * params.nPrevChan), totalSharedSize>>>(params.weights, spike_time_in, params.spike_time_out, dataLength);
 }
-struct layerParams {
-    int rfsize;
-    int stride;
-    int nNeurons;
-    int nSynapse;
-};
 
-void main(){
-    layerParams layers[3];
+// weights float -> weights uchar (* UINT8_MAX / gammaLength)
+/*
+ * Expected weights output format:
+ *  <---------------------> numNeuronPerColumn * rfSize
+ *  pos pos pos pos pos pos ^
+ *  neg neg neg neg neg neg |
+ *            ...           |
+ *  neg neg neg neg neg neg | numColumns * nChan * rfSize
+ *  pos pos pos pos pos pos |
+ *  neg neg neg neg neg neg v
+ * 
+ * Raw Weights output format for 1 neuron:
+ * <-            rfSize * nChans        ->
+ * |pos neg|pos neg|pos neg| ... |pos neg| ^
+ * |pos neg|pos neg|pos neg| ... |pos neg| |
+ * |pos neg|pos neg|pos neg| ... |pos neg| |
+ * |                   ...               | rfSize
+ * |pos neg|pos neg|pos neg| ... |pos neg| |
+ * |pos neg|pos neg|pos neg| ... |pos neg| |
+ * |pos neg|pos neg|pos neg| ... |pos neg| v
+ */
+    // column_kernel<<<dim3(params.outputDim, params.outputDim), 
+    //                 dim3(params.nNeurons, 
+    //                      params.rfsize, 
+    //                      params.rfsize * params.nPrevChan)>>>(params.weights, spike_time_in, params.spike_time_out, dataLength);
+    // const int numNeurons, const int rfSize, const int nChan,
+    // Each block generates image for 1 column, each thread writes pixel for 1 synapse weight
+__global__  void weightsToImg (const float* weights, uint8_t* device_img) {
+    const int columnID = blockIdx.y * gridDim.x + blockIdx.x; // for output
+
+    const int numNeuronPerColumn = blockDim.x;
+    const int rfSize = blockDim.y;
+    const int nChan = blockDim.z / rfSize;
+    const int numSynapsePerNeuron = rfSize * rfSize * nChan;
+    const int neuronID = threadIdx.x; //!< within a column
+    // synapseID (row major order, 2 channels for 1 pixel interleaves)
+    const int synapseID = threadIdx.y * blockDim.z + threadIdx.z; //!< within a neuron
+    // each synapse in each neuron has its own weights, updated across data samples
+    const int columnSynapseIdx = neuronID * numSynapsePerNeuron + synapseID;
+    const int layerSynapseIdx = numNeuronPerColumn * numSynapsePerNeuron * columnID + columnSynapseIdx;
+
+    const int rfXIdx = threadIdx.z / nChan;
+    const int chanID = threadIdx.z % nChan;
+    const int rfYIdx = threadIdx.y;
     
-    int dataLength = 10000;
+    const int gammaLength = 1 << cuConstTNNParams.wres;
+    
+    // TODO verify the below
+    const int outputPixelIdx = rfSize * rfSize * (numNeuronPerColumn * (columnID * nChan + chanID) + neuronID) + rfYIdx * rfSize + rfXIdx;
+    device_img[outputPixelIdx] = (uint8_t)(weights[layerSynapseIdx] * UINT8_MAX / gammaLength);
+}
 
-    char* spike_time_in = NULL;
-    cudaMalloc(&spike_time_in, sizeof(char) * dataLength * something);
-    load_MNIST("MNISTfilepath", dataLength, spike_time_in); // perform parallel load
+uint8_t* convertToHostImg(layerParams& params) {
+    uint8_t* device_img;
+    const int imgSize = params.rfsize * params.rfsize * params.nNeurons * params.nPrevChan * params.outputDim * params.outputDim;
+    cudaMalloc(&device_img, imgSize);
+    uint8_t* host_img = (uint8_t *)malloc(imgSize);
 
-    // setup constants
-    setup();
+    float * host_weights = (float *)malloc(imgSize*sizeof(float));
+    cudaMemcpy(host_weights, params.weights, imgSize*sizeof(float), cudaMemcpyDeviceToHost);
+    bool allZero = true;
+    int numZeros = 0;
+    int numNonzeros = 0;
+    for (int i = 0; i < imgSize; ++i) {
+        if (host_weights[i] == 0)
+            ++numZeros;
+        else
+            ++numNonzeros;
+    }
+    printf("numZeros = %d", numZeros);
+    printf("numNonzeros = %d", numNonzeros);
+    free(host_weights);
 
-    char* spike_time_out = NULL;
-    char* weight = NULL;
-    cudaMalloc(&weight, sizeof(int) * something);
-    cudaMalloc(&spike_time_in, sizeof(char) * something);
-    cudaMalloc(&spike_time_out, sizeof(char) * something);
-    launch_column(spike_time_in, dataLength, spike_time_out);
+    weightsToImg<<<dim3(params.outputDim, params.outputDim), 
+                    dim3(params.nNeurons, 
+                         params.rfsize, 
+                         params.rfsize * params.nPrevChan)>>>(params.weights, device_img);
+    cudaMemcpy(host_img, device_img, imgSize, cudaMemcpyDeviceToHost);
+    return host_img;
 }
