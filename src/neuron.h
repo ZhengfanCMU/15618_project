@@ -15,7 +15,7 @@ struct layerParams {
     char* spike_time_out;
     float* weights;
 };
-
+uint8_t* convertSpikesToHostImg(layerParams& params);
 void launch_load_MNIST(int nImgs, int nRows, int nCols, uint8_t* imgData, char* & spike_time_in);
 void copyLabelToDevice(int nLabels, uint8_t * labelData, char *& labels);
 void launch_column(layerParams& params, int dataLength, char* spike_time_in);

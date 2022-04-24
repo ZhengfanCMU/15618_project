@@ -26,74 +26,6 @@ bool assertAtFileEnd(FILE * file) {
     int elemRead = fread(&unused, 1, 1, file);
     return elemRead == 0 && feof(file);
 }
-/**
- * @brief 
- * 
- * @param[in] input_file 
- * @param[out] spike_time_in 
- */
-void load_MNIST(const char* image_input_file, const char* label_input_file, char* & spike_time_in, char* & labels) {
-    const uint32_t IDX3_MAGIC = 0x803;
-    const uint32_t IDX1_MAGIC = 0x801;
-    // Load input MNIST dataset and cudaMemcpy
-    // CudaMalloc spike_time_in and spike_time_out
-    // MNIST_loader_kernel
-    FILE * mnistImageFile = fopen(image_input_file, "r");
-    assert(mnistImageFile != NULL);
-    FILE * mnistLabelFile = fopen(label_input_file, "r");
-    assert(mnistLabelFile != NULL);
-
-    // Read image data
-    int32_t magic, dims3[3];
-    size_t elemRead = fread(&magic, sizeof(uint32_t), 1, mnistImageFile);
-    assert(elemRead == 1);
-    // MNIST dataset is big endian for the int32s
-    magic = ntohl(magic); // network order to host order long
-    assert(magic == IDX3_MAGIC);
-
-    elemRead = fread(&dims3, sizeof(uint32_t), 3, mnistImageFile);
-    assert(elemRead == 3);
-    for(int i = 0; i < 3; ++i) {
-        dims3[i] = ntohl(dims3[i]);
-    }
-    int32_t & nImgs = dims3[0];
-    int32_t & nRows = dims3[1];
-    int32_t & nCols = dims3[2];
-    assert(nRows == nCols && nCols == 28);
-
-    int nImageBytes = nImgs * nRows * nCols; // Each pixel has 1 byte.
-    uint8_t* imgData = (uint8_t*) malloc(nImageBytes);
-    assert(imgData != NULL);
-    elemRead = fread(imgData, sizeof(uint8_t), nImageBytes, mnistImageFile);
-    printf("nImageBytes %d; elemRead %d; \nnImgs %d nRows %d nCols %d\n", nImageBytes, elemRead, nImgs, nRows, nCols);
-    assert(elemRead == nImageBytes);
-    assert(assertAtFileEnd(mnistImageFile));
-    fclose(mnistImageFile);
-
-    // copy pixel data to device and launch kernel to convert
-    launch_load_MNIST(nImgs, nRows, nCols, imgData, spike_time_in);
-    free(imgData);
-
-    // Read label data into device memory as well for later classification
-    elemRead = fread(&magic, sizeof(uint32_t), 1, mnistLabelFile);
-    assert(elemRead == 1);
-    magic = ntohl(magic);
-    assert(magic == IDX1_MAGIC);
-    
-    int nLabels;
-    elemRead = fread(&nLabels, sizeof(uint32_t), 1, mnistLabelFile);
-    assert(elemRead == 1);
-    nLabels = ntohl(nLabels);
-
-    uint8_t * labelData = (uint8_t *)malloc(nLabels);
-    elemRead = fread(labelData, 1, nLabels, mnistLabelFile);
-    assert(elemRead == nLabels);
-    assert(assertAtFileEnd(mnistLabelFile));
-    fclose(mnistLabelFile);
-
-    copyLabelToDevice(nLabels, labelData, labels);
-    free(labelData);
-}
 void outputToBitmap(int x, int y, uint8_t* img, char* outputFile){
     FILE* outputfp = fopen(outputFile, "w");
     assert(outputfp != NULL);
@@ -138,7 +70,8 @@ void outputToBitmap(int x, int y, uint8_t* img, char* outputFile){
         colortable[i].g = (uint8_t)i;
         colortable[i].r = (uint8_t)i;
     }
-    int nPadBytes = 4 - (x % 4); // number of bytes to pad for each row
+    int nPadBytes = x % 4; // number of bytes to pad for each row
+    if(nPadBytes) nPadBytes = 4 - nPadBytes;
     int pixelArrSize = (x + nPadBytes) * y;
     int pixelDataOffset = sizeof(BMPhdr) + sizeof(BITMAPINFOHEADER) + sizeof(colorTableEntry) * nColorTableEntry;
     int nPadBeforePixelArr = ((pixelDataOffset + 3) / 4) * 4 - pixelDataOffset;
@@ -155,6 +88,75 @@ void outputToBitmap(int x, int y, uint8_t* img, char* outputFile){
     fclose(outputfp);
 }
 
+/**
+ * @brief 
+ * 
+ * @param[in] input_file 
+ * @param[out] spike_time_in 
+ */
+void load_MNIST(const char* image_input_file, const char* label_input_file, char* & spike_time_in, char* & labels) {
+    const uint32_t IDX3_MAGIC = 0x803;
+    const uint32_t IDX1_MAGIC = 0x801;
+    // Load input MNIST dataset and cudaMemcpy
+    // CudaMalloc spike_time_in and spike_time_out
+    // MNIST_loader_kernel
+    FILE * mnistImageFile = fopen(image_input_file, "r");
+    assert(mnistImageFile != NULL);
+    FILE * mnistLabelFile = fopen(label_input_file, "r");
+    assert(mnistLabelFile != NULL);
+
+    // Read image data
+    int32_t magic, dims3[3];
+    size_t elemRead = fread(&magic, sizeof(uint32_t), 1, mnistImageFile);
+    assert(elemRead == 1);
+    // MNIST dataset is big endian for the int32s
+    magic = ntohl(magic); // network order to host order long
+    assert(magic == IDX3_MAGIC);
+
+    elemRead = fread(&dims3, sizeof(uint32_t), 3, mnistImageFile);
+    assert(elemRead == 3);
+    for(int i = 0; i < 3; ++i) {
+        dims3[i] = ntohl(dims3[i]);
+    }
+    int32_t & nImgs = dims3[0];
+    int32_t & nRows = dims3[1];
+    int32_t & nCols = dims3[2];
+    assert(nRows == nCols && nCols == 28);
+
+    int nImageBytes = nImgs * nRows * nCols; // Each pixel has 1 byte.
+    uint8_t* imgData = (uint8_t*) malloc(nImageBytes);
+    assert(imgData != NULL);
+    elemRead = fread(imgData, sizeof(uint8_t), nImageBytes, mnistImageFile);
+    printf("nImageBytes %d; elemRead %d; \nnImgs %d nRows %d nCols %d\n", nImageBytes, elemRead, nImgs, nRows, nCols);
+    assert(elemRead == nImageBytes);
+    assert(assertAtFileEnd(mnistImageFile));
+    fclose(mnistImageFile);
+    outputToBitmap(28, 28*12, imgData, "mnistDirect.bmp");
+    // copy pixel data to device and launch kernel to convert
+    launch_load_MNIST(nImgs, nRows, nCols, imgData, spike_time_in);
+    free(imgData);
+
+    // Read label data into device memory as well for later classification
+    elemRead = fread(&magic, sizeof(uint32_t), 1, mnistLabelFile);
+    assert(elemRead == 1);
+    magic = ntohl(magic);
+    assert(magic == IDX1_MAGIC);
+    
+    int nLabels;
+    elemRead = fread(&nLabels, sizeof(uint32_t), 1, mnistLabelFile);
+    assert(elemRead == 1);
+    nLabels = ntohl(nLabels);
+
+    uint8_t * labelData = (uint8_t *)malloc(nLabels);
+    elemRead = fread(labelData, 1, nLabels, mnistLabelFile);
+    assert(elemRead == nLabels);
+    assert(assertAtFileEnd(mnistLabelFile));
+    fclose(mnistLabelFile);
+
+    copyLabelToDevice(nLabels, labelData, labels);
+    free(labelData);
+}
+
 int main(int argc, char **argv) {
     static_assert(sizeof(int) == 4, "int is not 32 bit");
     int dataLength = 10000;
@@ -165,15 +167,13 @@ int main(int argc, char **argv) {
     layerParams layers[3];
     layers[0] = {.inputDim = 28, .rfsize = 28, .stride = 1, .nNeurons = 12, .nPrevChan = 2};
     load_MNIST("data/train-images-idx3-ubyte", "data/train-labels-idx1-ubyte", spike_time_in, labels); // perform parallel load
+    layers[0].outputDim = 28;
+    layers[0].nNeurons = 12;
+    layers[0].spike_time_out = spike_time_in;
+    outputToBitmap(28*12, 28*2, convertSpikesToHostImg(layers[0]), "mnistSpikeDirect3.bmp");
     launch_column(layers[0], dataLength, spike_time_in);
     int outputxsize = layers[0].rfsize * layers[0].nNeurons;
     int outputysize = layers[0].rfsize * layers[0].nPrevChan * layers[0].outputDim * layers[0].outputDim;
-    outputToBitmap(outputxsize, outputysize, convertToHostImg(layers[0]), "weights.bmp");
-    uint8_t bitmaptest[64*256];
-    for(int i = 0; i < 64; ++i) {
-        for(int j = 0; j< 256; ++j) {
-            bitmaptest[i*256+j] = j;
-        }
-    }
-    outputToBitmap(256, 64, (uint8_t*)bitmaptest, "test3.bmp");
+    outputToBitmap(outputxsize, outputysize, convertToHostImg(layers[0]), "weights2.bmp");
+    
 }

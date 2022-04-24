@@ -35,7 +35,7 @@ __constant__ GlobalConstants cuConstTNNParams;
  * @param[in] cuMNISTdata MNIST data file loaded into cuda memory
  * @param[out] spike_time_in input spike time array to TNN layer in cuda memory
  */
-__global__ void MNIST_loader_kernel(const int pnThreshold, char * cuMNISTdata, char * spike_time_in) {
+__global__ void MNIST_loader_kernel(const int pnThreshold, uint8_t * cuMNISTdata, uint8_t * spike_time_in) {
     // sampleStart
     // numSamplesToConvert
     // rfsize
@@ -52,15 +52,15 @@ __global__ void MNIST_loader_kernel(const int pnThreshold, char * cuMNISTdata, c
     const int posSpikeIdx = dataIdx * 2;
     const int negSpikeIdx = dataIdx * 2 + 1;
 
-    spike_time_in[posSpikeIdx] = cuMNISTdata[dataIdx] < pnThreshold ? 0 : gammaLength;
-    spike_time_in[negSpikeIdx] = cuMNISTdata[dataIdx] >= pnThreshold ? 0 : gammaLength;
+    spike_time_in[posSpikeIdx] = cuMNISTdata[dataIdx] < 128 ? 0 : gammaLength;
+    spike_time_in[negSpikeIdx] = cuMNISTdata[dataIdx] >= 128 ? 0 : gammaLength;
 }
 
 
 void launch_load_MNIST(int nImgs, int nRows, int nCols, uint8_t* imgData, char* & spike_time_in) {
     // copy raw MNIST to device
     int nImageBytes = nImgs * nRows * nCols; // Each pixel is 1 byte.
-    char* imgData_device = NULL;
+    uint8_t * imgData_device = NULL;
     cudaError_t cuerr = cudaMalloc(&imgData_device, nImageBytes);
     assert(cuerr == cudaSuccess);
     cuerr = cudaMemcpy(imgData_device, imgData, nImageBytes, cudaMemcpyHostToDevice);
@@ -69,7 +69,7 @@ void launch_load_MNIST(int nImgs, int nRows, int nCols, uint8_t* imgData, char* 
     cuerr = cudaMalloc(&spike_time_in, nImageBytes * nChan);
     assert(cuerr == cudaSuccess);
     // launch kernel to convert to spike time
-    MNIST_loader_kernel<<<nImgs, dim3(nRows, nCols)>>>(UINT8_MAX/2, imgData_device, spike_time_in);
+    MNIST_loader_kernel<<<nImgs, dim3(nRows, nCols)>>>(UINT8_MAX/2, imgData_device, (uint8_t *)spike_time_in);
 }
 void copyLabelToDevice(int nLabels, uint8_t * labelData, char *& labels) {
     cudaError_t cuerr = cudaMalloc(&labels, nLabels);
@@ -305,7 +305,7 @@ void setup() {
     params.rate_capture = 1./2.;
     params.rate_backoff = 1./1024.;
     params.rate_search = 1./2.;
-    params.spikeThreshold = 4;
+    params.spikeThreshold = 400;
 
     cudaMemcpyToSymbol(&cuConstTNNParams, &params, sizeof(GlobalConstants));
 }
@@ -336,6 +336,14 @@ void launch_column(layerParams& params, int dataLength, char* spike_time_in) {
                     dim3(params.nNeurons, 
                          params.rfsize, 
                          params.rfsize * params.nPrevChan), totalSharedSize>>>(params.weights, spike_time_in, params.spike_time_out, dataLength);
+    cudaError_t err = cudaGetLastError();
+
+     if (err != cudaSuccess) {
+        printf("%s\n", cudaGetErrorString(err)); 
+        printf("outputDim %d, nNeurons %d, rfsize %d, nPrevChan %d\n", params.outputDim, params.nNeurons, params.rfsize, params.nPrevChan);
+        printf("Total grid dim %d, total block dim %d\n", params.outputDim * params.outputDim, params.nNeurons * params.rfsize * params.rfsize * params.nPrevChan);
+        printf("Total shared %d\n", totalSharedSize);
+     }
 }
 
 // weights float -> weights uchar (* UINT8_MAX / gammaLength)
@@ -396,8 +404,12 @@ uint8_t* convertToHostImg(layerParams& params) {
     cudaMalloc(&device_img, imgSize);
     uint8_t* host_img = (uint8_t *)malloc(imgSize);
 
+    int dataLength = 10000;
+    int spike_time_out_size = sizeof(char) * params.nNeurons * params.outputDim * params.outputDim * dataLength;
     float * host_weights = (float *)malloc(imgSize*sizeof(float));
+    char* host_spike_time_out = (char *)malloc(spike_time_out_size*sizeof(char));
     cudaMemcpy(host_weights, params.weights, imgSize*sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(host_spike_time_out, params.spike_time_out, spike_time_out_size, cudaMemcpyDeviceToHost);
     bool allZero = true;
     int numZeros = 0;
     int numNonzeros = 0;
@@ -407,14 +419,79 @@ uint8_t* convertToHostImg(layerParams& params) {
         else
             ++numNonzeros;
     }
-    printf("numZeros = %d", numZeros);
-    printf("numNonzeros = %d", numNonzeros);
+    printf("numZeros = %d\n", numZeros);
+    printf("numNonzeros = %d\n", numNonzeros);
     free(host_weights);
+
+    int numSpikes = 0;
+    int numInfs = 0;
+    const int gammaLength = 8;
+    for (int i = 0; i < spike_time_out_size; ++i) {
+        if (host_spike_time_out[i] == 0)
+            ++numSpikes;
+        else
+            ++numInfs;
+    }
+    printf("numSpikes = %d\n", numSpikes);
+    printf("numInfs = %d\n", numInfs);
+    free(host_spike_time_out);
 
     weightsToImg<<<dim3(params.outputDim, params.outputDim), 
                     dim3(params.nNeurons, 
                          params.rfsize, 
                          params.rfsize * params.nPrevChan)>>>(params.weights, device_img);
     cudaMemcpy(host_img, device_img, imgSize, cudaMemcpyDeviceToHost);
+    return host_img;
+}
+__global__  void spikesToImg (const char* spikes, uint8_t* device_img) {
+    // const int columnID = blockIdx.y * gridDim.x + blockIdx.x; // for output
+
+    // const int numNeuronPerColumn = blockDim.x;
+    // const int rfSize = blockDim.y;
+    // const int nChan = blockDim.z / rfSize;
+    // const int numSynapsePerNeuron = rfSize * rfSize * nChan;
+    // const int neuronID = threadIdx.x; //!< within a column
+    // // synapseID (row major order, 2 channels for 1 pixel interleaves)
+    // const int synapseID = threadIdx.y * blockDim.z + threadIdx.z; //!< within a neuron
+    // // each synapse in each neuron has its own weights, updated across data samples
+    // const int columnSynapseIdx = neuronID * numSynapsePerNeuron + synapseID;
+    // const int layerSynapseIdx = numNeuronPerColumn * numSynapsePerNeuron * columnID + columnSynapseIdx;
+
+    // const int rfXIdx = threadIdx.z / nChan;
+    // const int chanID = threadIdx.z % nChan;
+    // const int rfYIdx = threadIdx.y;
+    
+    const int gammaLength = 1 << cuConstTNNParams.wres;
+    
+    // TODO verify the below
+    const int nImg = gridDim.z;
+    const int imgId = blockIdx.z;
+    const int imgDim = gridDim.y;
+    const int spikePixelIdx = imgDim * imgDim * imgId + blockIdx.y * imgDim + blockIdx.x;
+
+    const int nChan = blockDim.x;
+    const int chanId = threadIdx.x;
+
+    const int spikeIdx = spikePixelIdx * nChan + chanId;
+    const int outputPixelXIdx = imgId * imgDim + blockIdx.x;
+    const int outputPixelYIdx = imgDim * chanId + blockIdx.y;
+    const int outputImgWidth = imgDim * nImg;
+    const int outputPixelIdx = outputPixelYIdx * outputImgWidth + outputPixelXIdx;
+    device_img[outputPixelIdx] = (uint8_t)(spikes[spikeIdx] * UINT8_MAX / gammaLength);
+}
+
+uint8_t* convertSpikesToHostImg(layerParams& params) {
+    // uint8_t* hostimg = (uint8_t *) malloc(params.inputDim * params.inputDim * 2 * 12);
+    // cudaMemcpy(hostimg, params.spike_time_out, params.inputDim * params.inputDim * 2 * 12, cudaMemcpyDeviceToHost);
+    // return hostimg;
+    uint8_t* device_img;
+    const int imgSize = params.rfsize * params.rfsize * params.nNeurons * params.nPrevChan * params.outputDim * params.outputDim;
+    cudaMalloc(&device_img, imgSize);
+    uint8_t* host_img = (uint8_t *)malloc(imgSize);
+
+    spikesToImg<<<dim3(params.outputDim, params.outputDim, 12), 
+                    2>>>(params.spike_time_out, device_img);
+    cudaMemcpy(host_img, device_img, imgSize, cudaMemcpyDeviceToHost);
+    cudaFree(device_img);
     return host_img;
 }
