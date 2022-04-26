@@ -120,14 +120,14 @@ __global__ void column_kernel(float* weights, char* spike_time_in, char* spike_t
     const int synapsesPerThread = xBatchSize * yBatchSize;
     // rows * columns of output spike times
     const int numColumns = gridDim.x * gridDim.y;
-    const int columnID = blockIdx.y * gridDim.x + blockIdx.x; // for output
+    const int columnIdx = blockIdx.y * gridDim.x + blockIdx.x; // for output
 
     const int numNeuronPerColumn = blockDim.x;
     // const int rfSize = blockDim.y; // TODO add to struct
     // const int nChan = blockDim.z / rfSize; // TODO add to struct
     // const int numSynapsePerNeuron = rfSize * rfSize * nChan; // TODO add to struct
 
-    const int neuronID = threadIdx.x; //!< within a column
+    const int neuronIdx = threadIdx.x; //!< within a column
 
 
     // Let each 3d thread block represent a neuron column:
@@ -231,9 +231,9 @@ __global__ void column_kernel(float* weights, char* spike_time_in, char* spike_t
             // for indexing into neuron local synapse
             const int neuronSynapseIdx = rfPixelIdx * nPrevChan + chanIdx;
             // for indexing into column local synapse
-            const int columnSynapseIdx = neuronID * numSynapsePerNeuron + neuronSynapseIdx;
+            const int columnSynapseIdx = neuronIdx * numSynapsePerNeuron + neuronSynapseIdx;
             // for indexing into layer synpase weights
-            const int layerSynapseIdx = numNeuronPerColumn * numSynapsePerNeuron * columnID + columnSynapseIdx;
+            const int layerSynapseIdx = numNeuronPerColumn * numSynapsePerNeuron * columnIdx + columnSynapseIdx;
             // half initialization for now
             weights[layerSynapseIdx] = (gammaLength - 1.) / 2;
             // TODO implement a choice of random initialization
@@ -242,13 +242,13 @@ __global__ void column_kernel(float* weights, char* spike_time_in, char* spike_t
 
     for (int dataIdx = 0; dataIdx < dataLength; ++dataLength) {
         // neuron corresponds to output wire
-        const int outputDataPixelIdx = dataIdx * numColumns + columnID;
-        const int outputNeuronIdx = outputDataPixelIdx * numNeuronPerColumn + neuronID;
+        const int outputDataPixelIdx = dataIdx * numColumns + columnIdx;
+        const int outputNeuronIdx = outputDataPixelIdx * numNeuronPerColumn + neuronIdx;
         if (threadIdx.y == 0 && threadIdx.z == 0) {
             // reset body potential for this gama cycle (single dataIdx)
-            neuronBodyPot_shared[neuronID] = 0;
+            neuronBodyPot_shared[neuronIdx] = 0;
             // reset spike time to gamma (no spike)
-            //spikeTimeOutNoInhibit[neuronID] = gammaLength;
+            //spikeTimeOutNoInhibit[neuronIdx] = gammaLength;
             spike_time_out[outputNeuronIdx] = gammaLength;
         }
         __syncthreads();
@@ -277,9 +277,9 @@ __global__ void column_kernel(float* weights, char* spike_time_in, char* spike_t
                 // for indexing into neuron local synapse
                 const int neuronSynapseIdx = rfPixelIdx * nPrevChan + chanIdx;
                 // for indexing into column local synapse
-                const int columnSynapseIdx = neuronID * numSynapsePerNeuron + neuronSynapseIdx;
+                const int columnSynapseIdx = neuronIdx * numSynapsePerNeuron + neuronSynapseIdx;
                 // for indexing into layer synpase weights
-                const int layerSynapseIdx = numNeuronPerColumn * numSynapsePerNeuron * columnID + columnSynapseIdx;
+                const int layerSynapseIdx = numNeuronPerColumn * numSynapsePerNeuron * columnIdx + columnSynapseIdx;
                 const int threadSynapseXIdx = rfXIdx - rfXIdxStart;
                 const int threadSynapseIdx = threadSynapseYIdx * xBatchSize + threadSynapseXIdx;
                 incStart[threadSynapseIdx] = spike_time_in[inputSpikeIdx];
@@ -319,9 +319,9 @@ __global__ void column_kernel(float* weights, char* spike_time_in, char* spike_t
                     // for indexing into neuron local synapse
                     const int neuronSynapseIdx = rfPixelIdx * nPrevChan + chanIdx;
                     // for indexing into column local synapse
-                    const int columnSynapseIdx = neuronID * numSynapsePerNeuron + neuronSynapseIdx;
+                    const int columnSynapseIdx = neuronIdx * numSynapsePerNeuron + neuronSynapseIdx;
                     // for indexing into layer synpase weights
-                    const int layerSynapseIdx = numNeuronPerColumn * numSynapsePerNeuron * columnID + columnSynapseIdx;
+                    const int layerSynapseIdx = numNeuronPerColumn * numSynapsePerNeuron * columnIdx + columnSynapseIdx;
 
                     // TODO loop through chanIdx and see if threads local synapses should contribute
                     // local incStart and incEnd to compare to cycle time
@@ -330,15 +330,88 @@ __global__ void column_kernel(float* weights, char* spike_time_in, char* spike_t
                     const int threadSynapseXIdx = rfXIdx - rfXIdxStart;
                     const int threadSynapseIdx = threadSynapseYIdx * xBatchSize + threadSynapseXIdx;
                     if (tickCycles >= incStart[threadSynapseIdx] && tickCycles < incEnd[threadSynapseIdx]) {
-                        atomicAdd_block(body_pot_shared[neuronID], 1);
+                        atomicAdd_block(neuronBodyPot_shared[neuronIdx], 1);
                     }
-                    // __syncthreads();
                 }
             }
-            // TODO calculate local contribution to bodyPot on each thread
-            // TODO atomicAdd_block to the bodyPot
+            __syncthreads();
+                            
+            if(threadIdx.y == 0 && threadIdx.z == 0) {            
+                if (neuronBodyPot_shared[neuronIdx] >= cuConstTNNParams.spikeThreshold) {
+                    // record the earliest spike in the column
+                    // Only synapse 0 need to do this, but not adding if condition
+                    // to avoid a conditional lane mask
+                    
+                    // NOTE: We assume when multiple threads writes the same address, HW will
+                    //       sequentialize writes. This would slow down the program.
+                    // NOTE: the assumption is that if multiple neuron spike at the same time, a race doesn't matter
+                    //       but that's with the assumption that tickCycles is synced
+                    // TODO: doublecheck if possible race condition among neurons affect correctness
+                    //       e.g. if neurons are across multiple warps and they are at different tickCycles
+                    if (earliestSpikingTime_shared > tickCycles) {
+                        earliestSpikingNeuron_shared = neuronIdx;
+                        earliestSpikingTime_shared = tickCycles;
+                    }
+                }
+            }
+
+            __syncthreads();
+            // In case neuron reaches firing threshold in this cycle
+            if (neuronBodyPot_shared[neuronIdx] >= cuConstTNNParams.spikeThreshold) {
+                // used to test race conditions
+                assert(earliestSpikingTime_shared <= tickCycles);
+                break;
+            }
+        }
+
+        // 1-WTA spike time out
+        // reduce min for global spike time out
+        // thread 0 write earliestSpikingTime_shared to output at earliestSpikingNeuron_shared
+        // all the later spikes are inhibited by default
+        if (threadIdx.y == 0 && threadIdx.z == 0 && neuronIdx == earliestSpikingNeuron_shared) {
+            spike_time_out[outputDataPixelIdx * numNeuronPerColumn + earliestSpikingNeuron_shared] = earliestSpikingTime_shared;
+        }
+        
+        // STDP and update weights
+        for(int rfYIdx = rfYIdxStart; rfYIdx < rfYIdxEnd; ++rfYIdx) {
+            for(int rfXIdx = rfXIdxStart; rfXIdx < rfXIdxEnd; ++rfXIdx) {
+                const int spikeTimeInputX = blockIdx.x + rfXIdx;
+                const int spikeTimeInputY = blockIdx.y + rfYIdx;
+                const int inputPixelIdx = spikeTimeInputY * inputImgSizeX + spikeTimeInputX;
+
+                // index into spike_time_in for this synapse
+                const int dataPixelIdx = dataIdx * numInputPixels + inputPixelIdx;
+                const int inputSpikeIdx = dataPixelIdx * nPrevChan + chanIdx;
+
+                const int rfPixelIdx = rfSize * rfYIdx + rfXIdx;
+                // for indexing into neuron local synapse
+                const int neuronSynapseIdx = rfPixelIdx * nPrevChan + chanIdx;
+                // for indexing into column local synapse
+                const int columnSynapseIdx = neuronIdx * numSynapsePerNeuron + neuronSynapseIdx;
+                // for indexing into layer synpase weights
+                const int layerSynapseIdx = numNeuronPerColumn * numSynapsePerNeuron * columnIdx + columnSynapseIdx;
+
+                bool isCausal = spike_time_in[inputSpikeIdx] <= spike_time_out[outputNeuronIdx];
+                bool inHasSpike = spike_time_in[inputSpikeIdx] < gammaLength;
+                bool outHasSpike = spike_time_out[outputNeuronIdx] < gammaLength;
+                bool isCapture = inHasSpike && outHasSpike && isCausal;
+                bool isBackoff = (inHasSpike && outHasSpike && !isCausal) ||
+                                (!inHasSpike && outHasSpike);
+                bool isSearch = inHasSpike && !outHasSpike;
+                //  w_max = gammaLength - 1
+                bool weightOverHalf = weights[layerSynapseIdx] >= (gammaLength - 1.) / 2.;
+                float stabUp = weightOverHalf ? cuConstTNNParams.rate_capture : (cuConstTNNParams.rate_capture / 2.);
+                float stabDown = !weightOverHalf ? cuConstTNNParams.rate_backoff : (cuConstTNNParams.rate_backoff / 2.);
+                if (isCapture) weights[layerSynapseIdx] += cuConstTNNParams.rate_capture * stabUp;
+                else if (isBackoff) weights[layerSynapseIdx] -= cuConstTNNParams.rate_backoff * stabDown;
+                else if (isSearch) weights[layerSynapseIdx] += cuConstTNNParams.rate_search;
+                // Clamp weights between 0 and gammalength - 1
+                weights[layerSynapseIdx] = weights[layerSynapseIdx] < 0. ? 0. : weights[layerSynapseIdx];
+                weights[layerSynapseIdx] = weights[layerSynapseIdx] > (gammaLength - 1.) ? (gammaLength - 1.) : weights[layerSynapseIdx];
+            }
+        }
     }
-    
+    // TODO: delete below
 
     // Each thread keeps several local synpase_rnl functions, and at each time tick,
     // each thread computes a local increament and use atomicAdd_block to the shared
@@ -369,16 +442,16 @@ __global__ void column_kernel(float* weights, char* spike_time_in, char* spike_t
         // reset increment indicator
         synapseRNL_shared[columnSynapseIdx] = false;
         // reset earliest time
-        if (neuronID == 0 && synapseID == 0) {
+        if (neuronIdx == 0 && synapseID == 0) {
             earliestSpikingTime_shared = gammaLength;
         }
             
         // neuron corresponds to output wire
-        const int outputDataPixelIdx = dataIdx * numColumns + columnID;
-        const int outputNeuronIdx = outputDataPixelIdx * numNeuronPerColumn + neuronID;
+        const int outputDataPixelIdx = dataIdx * numColumns + columnIdx;
+        const int outputNeuronIdx = outputDataPixelIdx * numNeuronPerColumn + neuronIdx;
         if (synapseID == 0) {
             // reset body potential for this gama cycle (single dataIdx)
-            neuronBodyPot_shared[neuronID] = 0;
+            neuronBodyPot_shared[neuronIdx] = 0;
             // reset spike time to gamma (no spike)
             //spikeTimeOutNoInhibit[neuronID] = gammaLength;
             spike_time_out[outputNeuronIdx] = gammaLength;
@@ -398,9 +471,9 @@ __global__ void column_kernel(float* weights, char* spike_time_in, char* spike_t
                 // sum the synapseRNL_shareds for each neuron's body potential
                 // TODO: maybe change to binary reduction add
                 for (int synapseIdx = 0; synapseIdx < numSynapsePerNeuron; ++synapseIdx) {
-                    neuronBodyPot_shared[neuronID] += synapseRNL_shared[neuronID * numSynapsePerNeuron + synapseIdx];
+                    neuronBodyPot_shared[neuronIdx] += synapseRNL_shared[neuronIdx * numSynapsePerNeuron + synapseIdx];
                 }
-                if (neuronBodyPot_shared[neuronID] >= cuConstTNNParams.spikeThreshold) {
+                if (neuronBodyPot_shared[neuronIdx] >= cuConstTNNParams.spikeThreshold) {
                     // record the earliest spike in the column
                     // Only synapse 0 need to do this, but not adding if condition
                     // to avoid a conditional lane mask
@@ -412,14 +485,14 @@ __global__ void column_kernel(float* weights, char* spike_time_in, char* spike_t
                     // TODO: doublecheck if possible race condition among neurons affect correctness
                     //       e.g. if neurons are across multiple warps and they are at different tickCycles
                     if (earliestSpikingTime_shared > tickCycles) {
-                        earliestSpikingNeuron_shared = neuronID;
+                        earliestSpikingNeuron_shared = neuronIdx;
                         earliestSpikingTime_shared = tickCycles;
                     }
                 }
             }
             __syncthreads();
             // In case neuron reaches firing threshold in this cycle
-            if (neuronBodyPot_shared[neuronID] >= cuConstTNNParams.spikeThreshold) {
+            if (neuronBodyPot_shared[neuronIdx] >= cuConstTNNParams.spikeThreshold) {
                 // used to test race conditions
                 assert(earliestSpikingTime_shared <= tickCycles);
                 break;
@@ -429,7 +502,7 @@ __global__ void column_kernel(float* weights, char* spike_time_in, char* spike_t
         // reduce min for global spike time out
         // thread 0 write earliestSpikingTime_shared to output at earliestSpikingNeuron_shared
         // all the later spikes are inhibited by default
-        if (synapseID == 0 && neuronID == earliestSpikingNeuron_shared) {
+        if (synapseID == 0 && neuronIdx == earliestSpikingNeuron_shared) {
             spike_time_out[outputDataPixelIdx * numNeuronPerColumn + earliestSpikingNeuron_shared] = earliestSpikingTime_shared;
         }
         
@@ -531,18 +604,18 @@ void launch_column(layerParams& params, int dataLength, char* spike_time_in) {
     // const int numNeurons, const int rfSize, const int nChan,
     // Each block generates image for 1 column, each thread writes pixel for 1 synapse weight
 __global__  void weightsToImg (const float* weights, uint8_t* device_img) {
-    const int columnID = blockIdx.y * gridDim.x + blockIdx.x; // for output
+    const int columnIdx = blockIdx.y * gridDim.x + blockIdx.x; // for output
 
     const int numNeuronPerColumn = blockDim.x;
     const int rfSize = blockDim.y;
     const int nChan = blockDim.z / rfSize;
     const int numSynapsePerNeuron = rfSize * rfSize * nChan;
-    const int neuronID = threadIdx.x; //!< within a column
+    const int neuronIdx = threadIdx.x; //!< within a column
     // synapseID (row major order, 2 channels for 1 pixel interleaves)
     const int synapseID = threadIdx.y * blockDim.z + threadIdx.z; //!< within a neuron
     // each synapse in each neuron has its own weights, updated across data samples
-    const int columnSynapseIdx = neuronID * numSynapsePerNeuron + synapseID;
-    const int layerSynapseIdx = numNeuronPerColumn * numSynapsePerNeuron * columnID + columnSynapseIdx;
+    const int columnSynapseIdx = neuronIdx * numSynapsePerNeuron + synapseID;
+    const int layerSynapseIdx = numNeuronPerColumn * numSynapsePerNeuron * columnIdx + columnSynapseIdx;
 
     const int rfXIdx = threadIdx.z / nChan;
     const int chanID = threadIdx.z % nChan;
@@ -551,7 +624,7 @@ __global__  void weightsToImg (const float* weights, uint8_t* device_img) {
     const int gammaLength = 1 << cuConstTNNParams.wres;
     
     // TODO verify the below
-    const int outputPixelIdx = rfSize * rfSize * (numNeuronPerColumn * (columnID * nChan + chanID) + neuronID) + rfYIdx * rfSize + rfXIdx;
+    const int outputPixelIdx = rfSize * rfSize * (numNeuronPerColumn * (columnIdx * nChan + chanID) + neuronIdx) + rfYIdx * rfSize + rfXIdx;
     device_img[outputPixelIdx] = (uint8_t)(weights[layerSynapseIdx] * UINT8_MAX / gammaLength);
 }
 
@@ -601,18 +674,18 @@ uint8_t* convertToHostImg(layerParams& params) {
     return host_img;
 }
 __global__  void spikesToImg (const char* spikes, uint8_t* device_img) {
-    // const int columnID = blockIdx.y * gridDim.x + blockIdx.x; // for output
+    // const int columnIdx = blockIdx.y * gridDim.x + blockIdx.x; // for output
 
     // const int numNeuronPerColumn = blockDim.x;
     // const int rfSize = blockDim.y;
     // const int nChan = blockDim.z / rfSize;
     // const int numSynapsePerNeuron = rfSize * rfSize * nChan;
-    // const int neuronID = threadIdx.x; //!< within a column
+    // const int neuronIdx = threadIdx.x; //!< within a column
     // // synapseID (row major order, 2 channels for 1 pixel interleaves)
     // const int synapseID = threadIdx.y * blockDim.z + threadIdx.z; //!< within a neuron
     // // each synapse in each neuron has its own weights, updated across data samples
-    // const int columnSynapseIdx = neuronID * numSynapsePerNeuron + synapseID;
-    // const int layerSynapseIdx = numNeuronPerColumn * numSynapsePerNeuron * columnID + columnSynapseIdx;
+    // const int columnSynapseIdx = neuronIdx * numSynapsePerNeuron + synapseID;
+    // const int layerSynapseIdx = numNeuronPerColumn * numSynapsePerNeuron * columnIdx + columnSynapseIdx;
 
     // const int rfXIdx = threadIdx.z / nChan;
     // const int chanID = threadIdx.z % nChan;
