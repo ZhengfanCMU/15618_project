@@ -6,6 +6,7 @@
 #include <string>
 
 #include <cassert>
+#include <cmath>
 
 #include "CycleTimer.h"
 #include "neuron.h"
@@ -39,7 +40,7 @@ __constant__ GlobalConstants cuConstTNNParams;
 __global__ void MNIST_loader_kernel(const int pnThreshold, uint8_t * cuMNISTdata, uint8_t * spike_time_in) {
     // sampleStart
     // numSamplesToConvert
-    // rfsize
+    // rfSize
     // stride
     // channels/format determined by kernel itself
 
@@ -108,16 +109,18 @@ void copyLabelToDevice(int nLabels, uint8_t * labelData, char *& labels) {
                 TODO: maybe change to k-WTA
  * @param[in]    dataLength number of images in the input and output
  */
-__global__ void column_kernel(float* weights, char* spike_time_in, char* spike_time_out, int dataLength) {
-    // TODO add to params
-    const int rfSize = 28;
-    const int yBatchSize = 7;
-    const int xBatchSize = 7;
-    const int nPrevChan = 2;
+__global__ void column_kernel(layerParams params, int dataLength, char* spike_time_in) {
+    float* weights = params.weights;
+    char* spike_time_out = params.spike_time_out;
+    const int rfSize = params.rfSize;
+    const int yBatchSize = params.yBatchSize;
+    const int xBatchSize = params.xBatchSize;
+    const int nPrevChan = params.nPrevChan;
     const int numSynapsePerNeuron = rfSize * rfSize * nPrevChan;
 
     const int gammaLength = 1 << cuConstTNNParams.wres;
     const int synapsesPerThread = xBatchSize * yBatchSize;
+    //assert(synapsesPerThread < 1024);
     // rows * columns of output spike times
     const int numColumns = gridDim.x * gridDim.y;
     const int columnIdx = blockIdx.y * gridDim.x + blockIdx.x; // for output
@@ -160,20 +163,20 @@ __global__ void column_kernel(float* weights, char* spike_time_in, char* spike_t
     /*
     Per column:
     nNeuron
-    nSynapse per neuron: = rfsize*rfsize*nprevchan
+    nSynapse per neuron: = rfSize*rfSize*nprevchan
         nPrevChan
-        rfsize
+        rfSize
     Per neuron: sum synapse at each timestep and check firing
     Within column: WTA across neuron firing time
     STDP requires 1 final neuron firing time for weight update per neuron's synapse
     */
 
-    // small rfsize: nNeuron*nSynapse fits within threadsPerBlock
+    // small rfSize: nNeuron*nSynapse fits within threadsPerBlock
 
-    // large rfsize: only rfsize*rfsize(maybe nprevchan) fits within threadsPerBlock
+    // large rfSize: only rfSize*rfSize(maybe nprevchan) fits within threadsPerBlock
 
     // parallelize as much synapse as possible but loop through neuron
-    // phase 1 threads: rfsize*rfsize*fraction of nprevchan,
+    // phase 1 threads: rfSize*rfSize*fraction of nprevchan,
     // Each thread loops through the rest of the nprevchan fraction,
     // neurons parallelized across blocks, write spike time to spike_time_out 
     // (unable to sync across block, so maybe still loop through neurons)
@@ -247,17 +250,18 @@ __global__ void column_kernel(float* weights, char* spike_time_in, char* spike_t
             spike_time_out[outputNeuronIdx] = gammaLength;
         }
         __syncthreads();
-
-        int incStart[synapsesPerThread];
-        int incEnd[synapsesPerThread];
+        
+        // TODO use larger consts later
+        int incStart[49];
+        int incEnd[49];
         // Loop through thread local synapses to initialize incStart and incEnd
         for(int rfYIdx = rfYIdxStart; rfYIdx < rfYIdxEnd; ++rfYIdx) {
             const int threadSynapseYIdx = rfYIdx - rfYIdxStart;
             for(int rfXIdx = rfXIdxStart; rfXIdx < rfXIdxEnd; ++rfXIdx) {
                 // non-padded convolution
                 // blockIdx is the output matrix x/y index
-                // image coord: (blockIdx.x - rfsize/2 to blockIdx.x + rfsize/2) + rfsize/2
-                //              (blockIdx.y - rfsize/2 to blockIdx.y + rfsize/2) + rfsize/2
+                // image coord: (blockIdx.x - rfSize/2 to blockIdx.x + rfSize/2) + rfSize/2
+                //              (blockIdx.y - rfSize/2 to blockIdx.y + rfSize/2) + rfSize/2
                 // TODO: consider different stride calculation, currently assuming stride == 1
                 const int spikeTimeInputX = blockIdx.x + rfXIdx;
                 const int spikeTimeInputY = blockIdx.y + rfYIdx;
@@ -384,8 +388,15 @@ void setup() {
     params.rate_backoff = 1./1024.;
     params.rate_search = 1./2.;
     params.spikeThreshold = 400;
-
-    cudaMemcpyToSymbol(&cuConstTNNParams, &params, sizeof(GlobalConstants));
+    cudaError_t err = cudaGetLastError(); // clear any previous error
+    if (err != cudaSuccess) {
+        printf("Cuda error before memcpy to symbol: %s\n", cudaGetErrorString(err)); 
+    }
+    cudaMemcpyToSymbol(cuConstTNNParams, &params, sizeof(GlobalConstants));
+    err = cudaGetLastError(); // clear any previous error
+    if (err != cudaSuccess) {
+        printf("Cuda error while memcpy to symbol: %s\n", cudaGetErrorString(err)); 
+    }
 }
 
 
@@ -399,9 +410,9 @@ void setup() {
  */
 void launch_column(layerParams& params, int dataLength, char* spike_time_in) {
     assert(params.stride == 1);
-    params.outputDim = (params.inputDim - params.rfsize)/params.stride + 1;
+    params.outputDim = (params.inputDim - params.rfSize)/params.stride + 1;
     
-    params.nSynapsesPerNeuron = params.rfsize * params.rfsize * params.nPrevChan;
+    params.nSynapsesPerNeuron = params.rfSize * params.rfSize * params.nPrevChan;
     
     // weights are initialized in the kernel
     cudaMalloc(&params.weights, sizeof(float) * params.nSynapsesPerNeuron 
@@ -410,22 +421,29 @@ void launch_column(layerParams& params, int dataLength, char* spike_time_in) {
     
     cudaMalloc(&params.spike_time_out, sizeof(char) * params.nNeurons * params.outputDim * params.outputDim * dataLength);
     int totalSharedSize = sizeof(int) * params.nNeurons + sizeof(int)*2 + sizeof(bool) * params.nSynapsesPerNeuron * params.nNeurons;
-    // TODO change kernel configuration
     // column_kernel<<<dim3(params.outputDim, params.outputDim), 
     //                 dim3(params.nNeurons, 
-    //                      params.rfsize, 
-    //                      params.rfsize * params.nPrevChan), totalSharedSize>>>(params.weights, spike_time_in, params.spike_time_out, dataLength);
-    
-    column_kernel<<<dim3(params.outputDim, params.outputDim), 
-                    dim3(params.nNeurons, 
-                         (params.rfsize + 6) / 7, 
-                         (params.rfsize + 6) / 7 * params.nPrevChan), totalSharedSize>>>(params.weights, spike_time_in, params.spike_time_out, dataLength);
-    cudaError_t err = cudaGetLastError();
+    //                      params.rfSize, 
+    //                      params.rfSize * params.nPrevChan), totalSharedSize>>>(params.weights, spike_time_in, params.spike_time_out, dataLength);
+    int nXYthreads = static_cast<int>(floor(sqrt(1024.0/params.nNeurons/params.nPrevChan)));
+    if (nXYthreads < 1) assert(false && "nNeuron and nPrevChan not supported");
+    int batchSize = (params.rfSize + nXYthreads - 1)/nXYthreads;
+    params.xBatchSize = batchSize;
+    params.yBatchSize = batchSize;
+    cudaError_t err = cudaGetLastError(); // clear any previous error
+    if (err != cudaSuccess) {
+        printf("Cuda error before kernel launch: %s\n", cudaGetErrorString(err)); 
+    }
+    // nXYthreads from batch size: (params.rfSize + params.yBatchSize - 1) / params.yBatchSize
+    column_kernel<<<dim3(params.outputDim, params.outputDim),
+                    dim3(params.nNeurons, nXYthreads, nXYthreads * params.nPrevChan),
+                    totalSharedSize>>>(params, dataLength, spike_time_in);
+    err = cudaGetLastError();
 
      if (err != cudaSuccess) {
         printf("%s\n", cudaGetErrorString(err)); 
-        printf("outputDim %d, nNeurons %d, rfsize %d, nPrevChan %d\n", params.outputDim, params.nNeurons, params.rfsize, params.nPrevChan);
-        printf("Total grid dim %d, total block dim %d\n", params.outputDim * params.outputDim, params.nNeurons * params.rfsize * params.rfsize * params.nPrevChan);
+        printf("outputDim %d, nNeurons %d, rfSize %d, nPrevChan %d\n", params.outputDim, params.nNeurons, params.rfSize, params.nPrevChan);
+        printf("Total grid dim %d, total block dim %d\n", params.outputDim * params.outputDim, params.nNeurons * params.rfSize * params.rfSize * params.nPrevChan);
         printf("Total shared %d\n", totalSharedSize);
      }
 }
@@ -453,47 +471,66 @@ void launch_column(layerParams& params, int dataLength, char* spike_time_in) {
  */
     // column_kernel<<<dim3(params.outputDim, params.outputDim), 
     //                 dim3(params.nNeurons, 
-    //                      params.rfsize, 
-    //                      params.rfsize * params.nPrevChan)>>>(params.weights, spike_time_in, params.spike_time_out, dataLength);
+    //                      params.rfSize, 
+    //                      params.rfSize * params.nPrevChan)>>>(params.weights, spike_time_in, params.spike_time_out, dataLength);
     // const int numNeurons, const int rfSize, const int nChan,
     // Each block generates image for 1 column, each thread writes pixel for 1 synapse weight
 // TODO change kernel configuration
-__global__  void weightsToImg (const float* weights, uint8_t* device_img) {
+__global__  void weightsToImg (layerParams params, uint8_t* device_img) {
+    float* weights = params.weights;
+    const int rfSize = params.rfSize;
+    const int yBatchSize = params.yBatchSize;
+    const int xBatchSize = params.xBatchSize;
+    const int nPrevChan = params.nPrevChan;
+    const int numSynapsePerNeuron = rfSize * rfSize * nPrevChan;
+
+    const int gammaLength = 1 << cuConstTNNParams.wres;
+    // rows * columns of output spike times
     const int columnIdx = blockIdx.y * gridDim.x + blockIdx.x; // for output
 
     const int numNeuronPerColumn = blockDim.x;
-    const int rfSize = blockDim.y;
-    const int nChan = blockDim.z / rfSize;
-    const int numSynapsePerNeuron = rfSize * rfSize * nChan;
-    const int neuronIdx = threadIdx.x; //!< within a column
-    // synapseID (row major order, 2 channels for 1 pixel interleaves)
-    const int synapseID = threadIdx.y * blockDim.z + threadIdx.z; //!< within a neuron
-    // each synapse in each neuron has its own weights, updated across data samples
-    const int columnSynapseIdx = neuronIdx * numSynapsePerNeuron + synapseID;
-    const int layerSynapseIdx = numNeuronPerColumn * numSynapsePerNeuron * columnIdx + columnSynapseIdx;
 
-    const int rfXIdx = threadIdx.z / nChan;
-    const int chanID = threadIdx.z % nChan;
-    const int rfYIdx = threadIdx.y;
-    
-    const int gammaLength = 1 << cuConstTNNParams.wres;
-    
-    // TODO verify the below
-    const int outputPixelIdx = rfSize * rfSize * (numNeuronPerColumn * (columnIdx * nChan + chanID) + neuronIdx) + rfYIdx * rfSize + rfXIdx;
-    device_img[outputPixelIdx] = (uint8_t)(weights[layerSynapseIdx] * UINT8_MAX / gammaLength);
+    // Actual kernal launch parameters for now:
+    // nNeuron, nYbatches, nXbatches* nPrevChan
+    const int neuronIdx = threadIdx.x;
+    const int yBatchIdx = threadIdx.y;
+    const int xBatchIdx = threadIdx.z / nPrevChan;
+    const int chanIdx = threadIdx.z % nPrevChan;
+
+    const int rfYIdxStart = yBatchIdx * yBatchSize;
+    int _rfYIdxEnd = (yBatchIdx + 1) * yBatchSize;
+    const int rfYIdxEnd = _rfYIdxEnd < rfSize ? _rfYIdxEnd : rfSize;
+
+    const int rfXIdxStart = xBatchIdx * xBatchSize;
+    int _rfXIdxEnd = (xBatchIdx + 1) * xBatchSize;
+    const int rfXIdxEnd = _rfXIdxEnd < rfSize ? _rfXIdxEnd : rfSize;
+    for(int rfYIdx = rfYIdxStart; rfYIdx < rfYIdxEnd; ++rfYIdx) {
+        for(int rfXIdx = rfXIdxStart; rfXIdx < rfXIdxEnd; ++rfXIdx) {
+            const int rfPixelIdx = rfSize * rfYIdx + rfXIdx;
+            // for indexing into neuron local synapse
+            const int neuronSynapseIdx = rfPixelIdx * nPrevChan + chanIdx;
+            // for indexing into column local synapse
+            const int columnSynapseIdx = neuronIdx * numSynapsePerNeuron + neuronSynapseIdx;
+            // for indexing into layer synpase weights
+            const int layerSynapseIdx = numNeuronPerColumn * numSynapsePerNeuron * columnIdx + columnSynapseIdx;
+            // TODO verify the below
+            const int outputPixelIdx = rfSize * rfSize * (numNeuronPerColumn * (columnIdx * nPrevChan + chanIdx) + neuronIdx) + rfYIdx * rfSize + rfXIdx;
+            device_img[outputPixelIdx] = (uint8_t)(weights[layerSynapseIdx] * UINT8_MAX / gammaLength);
+        }
+    }
 }
 
 uint8_t* convertToHostImg(layerParams& params) {
     uint8_t* device_img;
-    const int imgSize = params.rfsize * params.rfsize * params.nNeurons * params.nPrevChan * params.outputDim * params.outputDim;
+    const int imgSize = params.rfSize * params.rfSize * params.nNeurons * params.nPrevChan * params.outputDim * params.outputDim;
     cudaMalloc(&device_img, imgSize);
     uint8_t* host_img = (uint8_t *)malloc(imgSize);
 
     // TODO change kernel configuration
+    int nXYthreads = static_cast<int>(floor(sqrt(1024.0/params.nNeurons/params.nPrevChan)));
+    if (nXYthreads < 1) assert(false && "nNeuron and nPrevChan not supported");
     weightsToImg<<<dim3(params.outputDim, params.outputDim), 
-                    dim3(params.nNeurons, 
-                         params.rfsize, 
-                         params.rfsize * params.nPrevChan)>>>(params.weights, device_img);
+                    dim3(params.nNeurons, nXYthreads, nXYthreads * params.nPrevChan)>>>(params, device_img);
     cudaMemcpy(host_img, device_img, imgSize, cudaMemcpyDeviceToHost);
     return host_img;
 }
@@ -539,7 +576,7 @@ uint8_t* convertSpikesToHostImg(layerParams& params) {
     // cudaMemcpy(hostimg, params.spike_time_out, params.inputDim * params.inputDim * 2 * 12, cudaMemcpyDeviceToHost);
     // return hostimg;
     uint8_t* device_img;
-    const int imgSize = params.rfsize * params.rfsize * params.nNeurons * params.nPrevChan * params.outputDim * params.outputDim;
+    const int imgSize = params.rfSize * params.rfSize * params.nNeurons * params.nPrevChan * params.outputDim * params.outputDim;
     cudaMalloc(&device_img, imgSize);
     uint8_t* host_img = (uint8_t *)malloc(imgSize);
 

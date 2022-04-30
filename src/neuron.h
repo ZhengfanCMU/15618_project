@@ -1,7 +1,7 @@
 #include <stdint.h>
 struct layerParams {
     int inputDim;
-    int rfsize;
+    int rfSize;
     int stride; //stride only supports 1 for now
     int nNeurons; // number of neurons per column / number of output channels
     int nPrevChan; // prev layer's nNeurons / number of input channels

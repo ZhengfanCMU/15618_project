@@ -165,15 +165,15 @@ int main(int argc, char **argv) {
     // setup constants
     setup();
     layerParams layers[3];
-    layers[0] = {.inputDim = 28, .rfsize = 28, .stride = 1, .nNeurons = 12, .nPrevChan = 2};
+    layers[0] = {.inputDim = 28, .rfSize = 28, .stride = 1, .nNeurons = 12, .nPrevChan = 2};
     load_MNIST("data/train-images-idx3-ubyte", "data/train-labels-idx1-ubyte", spike_time_in, labels); // perform parallel load
     layers[0].outputDim = 28;
     layers[0].nNeurons = 12;
     layers[0].spike_time_out = spike_time_in;
     outputToBitmap(28*12, 28*2, convertSpikesToHostImg(layers[0]), "mnistSpikeDirect3.bmp");
     launch_column(layers[0], dataLength, spike_time_in);
-    int outputxsize = layers[0].rfsize * layers[0].nNeurons;
-    int outputysize = layers[0].rfsize * layers[0].nPrevChan * layers[0].outputDim * layers[0].outputDim;
+    int outputxsize = layers[0].rfSize * layers[0].nNeurons;
+    int outputysize = layers[0].rfSize * layers[0].nPrevChan * layers[0].outputDim * layers[0].outputDim;
     outputToBitmap(outputxsize, outputysize, convertToHostImg(layers[0]), "weights2.bmp");
     
 }
