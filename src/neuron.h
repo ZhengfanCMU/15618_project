@@ -10,6 +10,10 @@ struct layerParams {
     int outputDim; // Dimension of the output image
     int nSynapsesPerNeuron;
     
+    // Launch parameters
+    int xBatchSize;
+    int yBatchSize;
+
     // Records layer data pointers
     // (device addresses)
     char* spike_time_out;

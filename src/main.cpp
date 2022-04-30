@@ -72,9 +72,9 @@ void outputToBitmap(int x, int y, uint8_t* img, char* outputFile){
     }
     int nPadBytes = x % 4; // number of bytes to pad for each row
     if(nPadBytes) nPadBytes = 4 - nPadBytes;
-    int pixelArrSize = (x + nPadBytes) * y;
-    int pixelDataOffset = sizeof(BMPhdr) + sizeof(BITMAPINFOHEADER) + sizeof(colorTableEntry) * nColorTableEntry;
-    int nPadBeforePixelArr = ((pixelDataOffset + 3) / 4) * 4 - pixelDataOffset;
+    uint32_t pixelArrSize = (x + nPadBytes) * y;
+    uint32_t pixelDataOffset = sizeof(BMPhdr) + sizeof(BITMAPINFOHEADER) + sizeof(colorTableEntry) * nColorTableEntry;
+    uint32_t nPadBeforePixelArr = ((pixelDataOffset + 3) / 4) * 4 - pixelDataOffset;
     BMPhdr bmphdr{pixelDataOffset + nPadBeforePixelArr + pixelArrSize, pixelDataOffset + nPadBeforePixelArr};
     fwrite(&bmphdr, sizeof(BMPhdr), 1, outputfp);
     fwrite(&infohdr, sizeof(BITMAPINFOHEADER), 1, outputfp);
@@ -123,11 +123,11 @@ void load_MNIST(const char* image_input_file, const char* label_input_file, char
     int32_t & nCols = dims3[2];
     assert(nRows == nCols && nCols == 28);
 
-    int nImageBytes = nImgs * nRows * nCols; // Each pixel has 1 byte.
+    size_t nImageBytes = nImgs * nRows * nCols; // Each pixel has 1 byte.
     uint8_t* imgData = (uint8_t*) malloc(nImageBytes);
     assert(imgData != NULL);
     elemRead = fread(imgData, sizeof(uint8_t), nImageBytes, mnistImageFile);
-    printf("nImageBytes %d; elemRead %d; \nnImgs %d nRows %d nCols %d\n", nImageBytes, elemRead, nImgs, nRows, nCols);
+    printf("nImageBytes %lu; elemRead %lu; \nnImgs %d nRows %d nCols %d\n", nImageBytes, elemRead, nImgs, nRows, nCols);
     assert(elemRead == nImageBytes);
     assert(assertAtFileEnd(mnistImageFile));
     fclose(mnistImageFile);
@@ -149,7 +149,7 @@ void load_MNIST(const char* image_input_file, const char* label_input_file, char
 
     uint8_t * labelData = (uint8_t *)malloc(nLabels);
     elemRead = fread(labelData, 1, nLabels, mnistLabelFile);
-    assert(elemRead == nLabels);
+    assert(elemRead == (size_t)nLabels);
     assert(assertAtFileEnd(mnistLabelFile));
     fclose(mnistLabelFile);
 
