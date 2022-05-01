@@ -3,10 +3,13 @@
 #include <stdlib.h>
 #include <string>
 
+#include <errno.h>
+#include <libgen.h>
 #include "neuron.h"
 #include <cassert>
 #include <arpa/inet.h> // for endianness conversion
-void saxpyCuda(int N, float alpha, float *x, float *y, float *result);
+#include <string>
+
 void printCudaInfo();
 
 // return GB/s
@@ -101,6 +104,7 @@ void load_MNIST(const char* image_input_file, const char* label_input_file, char
     // CudaMalloc spike_time_in and spike_time_out
     // MNIST_loader_kernel
     FILE * mnistImageFile = fopen(image_input_file, "r");
+    int err = errno;
     assert(mnistImageFile != NULL);
     FILE * mnistLabelFile = fopen(label_input_file, "r");
     assert(mnistLabelFile != NULL);
@@ -158,22 +162,27 @@ void load_MNIST(const char* image_input_file, const char* label_input_file, char
 }
 
 int main(int argc, char **argv) {
+    using std::string;
     static_assert(sizeof(int) == 4, "int is not 32 bit");
     int dataLength = 10000;
     char* spike_time_in = NULL;
     char* labels = NULL;
+    string dirpath = dirname(argv[0]);
+    dirpath += string("/");
+    string mnistImgPath = "data/train-images-idx3-ubyte";
+    string mnistLabelPath = "data/train-labels-idx1-ubyte";
     // setup constants
     setup();
     layerParams layers[3];
     layers[0] = {.inputDim = 28, .rfSize = 28, .stride = 1, .nNeurons = 12, .nPrevChan = 2};
-    load_MNIST("data/train-images-idx3-ubyte", "data/train-labels-idx1-ubyte", spike_time_in, labels); // perform parallel load
+    load_MNIST((dirpath+mnistImgPath).c_str(), (dirpath+mnistLabelPath).c_str(), spike_time_in, labels); // perform parallel load
     layers[0].outputDim = 28;
     layers[0].nNeurons = 12;
-    layers[0].spike_time_out = spike_time_in;
-    outputToBitmap(28*12, 28*2, convertSpikesToHostImg(layers[0]), "mnistSpikeDirect3.bmp");
+    // layers[0].spike_time_out = spike_time_in;
+    // outputToBitmap(28*12, 28*2, convertSpikesToHostImg(layers[0]), "mnistSpikeDirect3.bmp");
     launch_column(layers[0], dataLength, spike_time_in);
     int outputxsize = layers[0].rfSize * layers[0].nNeurons;
     int outputysize = layers[0].rfSize * layers[0].nPrevChan * layers[0].outputDim * layers[0].outputDim;
-    outputToBitmap(outputxsize, outputysize, convertToHostImg(layers[0]), "weights2.bmp");
+    outputToBitmap(outputxsize, outputysize, convertToHostImg(layers[0]), "weights.bmp");
     
 }

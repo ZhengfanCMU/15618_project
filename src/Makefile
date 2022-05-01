@@ -21,6 +21,7 @@ NVCCFLAGS=-O0 -g -m64 --gpu-architecture compute_61 -ccbin /usr/bin/gcc -std=c++
 #-O3
 OBJS=$(OBJDIR)/main.o $(OBJDIR)/neuron.o
 
+PTXS=$(OBJDIR)/neuron.ptx
 
 .PHONY: dirs clean
 
@@ -34,7 +35,7 @@ dirs:
 clean:
 		rm -rf $(OBJDIR) *.ppm *~ $(EXECUTABLE)
 
-$(EXECUTABLE): dirs $(OBJS)
+$(EXECUTABLE): dirs $(OBJS) $(PTXS)
 		$(CXX) $(CXXFLAGS) -o $@ $(OBJS) $(LDFLAGS)
 
 $(OBJDIR)/%.o: %.cpp
@@ -43,4 +44,5 @@ $(OBJDIR)/%.o: %.cpp
 $(OBJDIR)/%.o: %.cu
 		$(NVCC) $< $(NVCCFLAGS) -c -o $@
 
-
+$(OBJDIR)/%.ptx: %.cu
+		$(NVCC) $< -ptx $(NVCCFLAGS) -o $@

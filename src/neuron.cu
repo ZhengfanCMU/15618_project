@@ -110,6 +110,8 @@ void copyLabelToDevice(int nLabels, uint8_t * labelData, char *& labels) {
  * @param[in]    dataLength number of images in the input and output
  */
 __global__ void column_kernel(layerParams params, int dataLength, char* spike_time_in) {
+    const int gammaLength = 1 << cuConstTNNParams.wres;
+
     float* weights = params.weights;
     char* spike_time_out = params.spike_time_out;
     const int rfSize = params.rfSize;
@@ -118,8 +120,8 @@ __global__ void column_kernel(layerParams params, int dataLength, char* spike_ti
     const int nPrevChan = params.nPrevChan;
     const int numSynapsePerNeuron = rfSize * rfSize * nPrevChan;
 
-    const int gammaLength = 1 << cuConstTNNParams.wres;
-    const int synapsesPerThread = xBatchSize * yBatchSize;
+    
+    // const int synapsesPerThread = xBatchSize * yBatchSize;
     //assert(synapsesPerThread < 1024);
     // rows * columns of output spike times
     const int numColumns = gridDim.x * gridDim.y;
@@ -420,7 +422,7 @@ void launch_column(layerParams& params, int dataLength, char* spike_time_in) {
                                             * params.outputDim * params.outputDim);
     
     cudaMalloc(&params.spike_time_out, sizeof(char) * params.nNeurons * params.outputDim * params.outputDim * dataLength);
-    int totalSharedSize = sizeof(int) * params.nNeurons + sizeof(int)*2 + sizeof(bool) * params.nSynapsesPerNeuron * params.nNeurons;
+    int totalSharedSize = sizeof(int) * params.nNeurons + sizeof(int)*2;
     // column_kernel<<<dim3(params.outputDim, params.outputDim), 
     //                 dim3(params.nNeurons, 
     //                      params.rfSize, 
@@ -438,6 +440,7 @@ void launch_column(layerParams& params, int dataLength, char* spike_time_in) {
     column_kernel<<<dim3(params.outputDim, params.outputDim),
                     dim3(params.nNeurons, nXYthreads, nXYthreads * params.nPrevChan),
                     totalSharedSize>>>(params, dataLength, spike_time_in);
+    cudaDeviceSynchronize();
     err = cudaGetLastError();
 
      if (err != cudaSuccess) {
@@ -514,25 +517,92 @@ __global__  void weightsToImg (layerParams params, uint8_t* device_img) {
             // for indexing into layer synpase weights
             const int layerSynapseIdx = numNeuronPerColumn * numSynapsePerNeuron * columnIdx + columnSynapseIdx;
             // TODO verify the below
-            const int outputPixelIdx = rfSize * rfSize * (numNeuronPerColumn * (columnIdx * nPrevChan + chanIdx) + neuronIdx) + rfYIdx * rfSize + rfXIdx;
+            const int outputPixelIdx = rfSize * rfSize * (numNeuronPerColumn * (columnIdx * nPrevChan + chanIdx) + neuronIdx) + rfPixelIdx;
             device_img[outputPixelIdx] = (uint8_t)(weights[layerSynapseIdx] * UINT8_MAX / gammaLength);
         }
     }
 }
 
+uint8_t * weightsToImg_sequential(layerParams& params) {
+    // just outputs 1 column for now
+    assert(params.outputDim == 1);
+    // float* weights = params.weights;
+    const int rfSize = params.rfSize;
+    // const int yBatchSize = params.yBatchSize;
+    // const int xBatchSize = params.xBatchSize;
+    const int nPrevChan = params.nPrevChan;
+    const int numSynapsePerNeuron = rfSize * rfSize * nPrevChan;
+
+    // const int gammaLength = 1 << cuConstTNNParams.wres;
+    int weightArrSize = params.outputDim * params.outputDim // columns
+                                          * params.nNeurons
+                                          * params.rfSize * params.rfSize * params.nPrevChan; // synapses
+    float * hostWeights = (float*) malloc(weightArrSize * sizeof(float));
+    cudaError_t err = cudaMemcpy(hostWeights, params.weights, weightArrSize * sizeof(float), cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) {
+        printf("Cuda error doing memcpy: %s\n", cudaGetErrorString(err)); 
+    }
+    // weightsToImg<<<dim3(params.outputDim, params.outputDim), 
+    //                 dim3(params.nNeurons, nXYthreads, nXYthreads * params.nPrevChan)>>>(params, device_img);
+
+    // // rows * columns of output spike times
+    // for (int columnIdx = 0; columnIdx < params.outputDim * params.outputDim; ++columnIdx){}
+    uint8_t * outimg = (uint8_t*) malloc(weightArrSize);
+    const int numNeuronPerColumn = params.nNeurons;
+
+    // // Actual kernal launch parameters for now:
+    // // nNeuron, nYbatches, nXbatches* nPrevChan
+    // const int neuronIdx = threadIdx.x;
+    // const int chanIdx = threadIdx.z % nPrevChan;
+    // xbatch0|xbatch1|xbatch2
+    // ch0ch1 |ch0ch1 |ch0ch1 
+    // th0th1  th2th3  th4th5
+    // thread 0: x01234 ch0
+    // thread 1: x01234 ch1
+
+    int outImgWidth = params.nNeurons * params.rfSize;
+    int columnIdx = 0;
+    for(int chanIdx = 0; chanIdx < params.nPrevChan; ++chanIdx) {
+        for(int rfYIdx = 0; rfYIdx < rfSize; ++rfYIdx) {
+            for(int neuronIdx = 0; neuronIdx < params.nNeurons; ++neuronIdx){
+                for(int rfXIdx = 0; rfXIdx < rfSize; ++rfXIdx) {
+                // column0,0|rf0,0 |rf0,1 |rf0,2 |rf1,0 |rf1,1 |rf1,2 |rf2,0 |rf2,1 |rf2,2 |
+                //   neuron0|ch0ch1|ch0ch1|ch0ch1|ch0ch1|ch0ch1|ch0ch1|ch0ch1|ch0ch1|ch0ch1|
+                //   neuron1
+                //   ...
+                // column0,1
+                    const int rfPixelIdx = rfSize * rfYIdx + rfXIdx;
+                    // for indexing into neuron local synapse
+                    const int neuronSynapseIdx = rfPixelIdx * nPrevChan + chanIdx;
+                    // for indexing into column local synapse
+                    const int columnSynapseIdx = neuronIdx * numSynapsePerNeuron + neuronSynapseIdx;
+                    // for indexing into layer synpase weights
+                    const int layerSynapseIdx = numNeuronPerColumn * numSynapsePerNeuron * columnIdx + columnSynapseIdx;
+                    int outImgX = neuronIdx * params.rfSize + rfXIdx;
+                    int outImgY = chanIdx * params.rfSize + rfYIdx;
+                    outimg[outImgY * outImgWidth + outImgX] = static_cast<uint8_t>(hostWeights[layerSynapseIdx] * 256.0 / 8.0);
+                }
+            }
+        }
+    }
+    free(hostWeights);
+    return outimg;
+}
+
 uint8_t* convertToHostImg(layerParams& params) {
-    uint8_t* device_img;
-    const int imgSize = params.rfSize * params.rfSize * params.nNeurons * params.nPrevChan * params.outputDim * params.outputDim;
-    cudaMalloc(&device_img, imgSize);
-    uint8_t* host_img = (uint8_t *)malloc(imgSize);
+    // uint8_t* device_img;
+    // const int imgSize = params.rfSize * params.rfSize * params.nNeurons * params.nPrevChan * params.outputDim * params.outputDim;
+    //cudaMalloc(&device_img, imgSize);
+    //uint8_t* host_img = (uint8_t *)malloc(imgSize);
 
     // TODO change kernel configuration
     int nXYthreads = static_cast<int>(floor(sqrt(1024.0/params.nNeurons/params.nPrevChan)));
     if (nXYthreads < 1) assert(false && "nNeuron and nPrevChan not supported");
-    weightsToImg<<<dim3(params.outputDim, params.outputDim), 
-                    dim3(params.nNeurons, nXYthreads, nXYthreads * params.nPrevChan)>>>(params, device_img);
-    cudaMemcpy(host_img, device_img, imgSize, cudaMemcpyDeviceToHost);
-    return host_img;
+    // weightsToImg<<<dim3(params.outputDim, params.outputDim), 
+    //                 dim3(params.nNeurons, nXYthreads, nXYthreads * params.nPrevChan)>>>(params, device_img);
+    //cudaMemcpy(host_img, device_img, imgSize, cudaMemcpyDeviceToHost);
+
+    return weightsToImg_sequential(params);//host_img;
 }
 __global__  void spikesToImg (const char* spikes, uint8_t* device_img) {
     // const int columnIdx = blockIdx.y * gridDim.x + blockIdx.x; // for output
