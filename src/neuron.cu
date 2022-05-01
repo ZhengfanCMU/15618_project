@@ -37,7 +37,7 @@ __constant__ GlobalConstants cuConstTNNParams;
  * @param[in] cuMNISTdata MNIST data file loaded into cuda memory
  * @param[out] spike_time_in input spike time array to TNN layer in cuda memory
  */
-__global__ void MNIST_loader_kernel(const int pnThreshold, uint8_t * cuMNISTdata, uint8_t * spike_time_in) {
+__global__ void MNIST_loader_kernel(const int pnThreshold, uint8_t * cuMNISTdata, char * spike_time_in) {
     // sampleStart
     // numSamplesToConvert
     // rfSize
@@ -68,10 +68,15 @@ void launch_load_MNIST(int nImgs, int nRows, int nCols, uint8_t* imgData, char* 
     cuerr = cudaMemcpy(imgData_device, imgData, nImageBytes, cudaMemcpyHostToDevice);
     assert(cuerr == cudaSuccess);
     int nChan = 2;
-    cuerr = cudaMalloc(&spike_time_in, nImageBytes * nChan);
+    cuerr = cudaMalloc(&spike_time_in, sizeof(char) * nImageBytes * nChan);
     assert(cuerr == cudaSuccess);
     // launch kernel to convert to spike time
-    MNIST_loader_kernel<<<nImgs, dim3(nRows, nCols)>>>(UINT8_MAX/2, imgData_device, (uint8_t *)spike_time_in);
+    MNIST_loader_kernel<<<nImgs, dim3(nRows, nCols)>>>(UINT8_MAX/2, imgData_device, spike_time_in);
+    cudaDeviceSynchronize();
+    cuerr = cudaGetLastError(); // clear any previous error
+    if (cuerr != cudaSuccess) {
+        printf("Cuda error after MNIST_loader_kernel: %s\n", cudaGetErrorString(cuerr)); 
+    }
 }
 void copyLabelToDevice(int nLabels, uint8_t * labelData, char *& labels) {
     cudaError_t cuerr = cudaMalloc(&labels, nLabels);
@@ -157,11 +162,12 @@ __global__ void column_kernel(layerParams params, int dataLength, char* spike_ti
     // __shared__ int earliestSpikingNeuron_shared;
     // __shared__ int earliestSpikingTime_shared;
     // int totalSharedSize = sizeof(int) * numNeuronPerColumn + sizeof(int)*2 + sizeof(bool) * numSynapsePerNeuron * numNeuronPerColumn;
-    extern __shared__ uint8_t _AllShared[];
+    extern __shared__ int _AllShared[];
     // bool * const& synapseRNL_shared = (bool*) &_AllShared[sizeof(int) * numNeuronPerColumn + sizeof(int)*2];
-    int * const& neuronBodyPot_shared = (int*) &_AllShared[2];
-    int & earliestSpikingNeuron_shared = *((int*) &_AllShared[0]);
-    int & earliestSpikingTime_shared = *((int*) &_AllShared[1]);
+    // int totalSharedSize = sizeof(int) * params.nNeurons + sizeof(int)*2;
+    int * const& neuronBodyPot_shared = _AllShared;
+    int & earliestSpikingNeuron_shared = _AllShared[numNeuronPerColumn];
+    int & earliestSpikingTime_shared = _AllShared[numNeuronPerColumn + 1];
     /*
     Per column:
     nNeuron
@@ -240,7 +246,10 @@ __global__ void column_kernel(layerParams params, int dataLength, char* spike_ti
         }
     }
 
-    for (int dataIdx = 0; dataIdx < dataLength; ++dataLength) {
+    for (int dataIdx = 0; dataIdx < dataLength; ++dataIdx) {
+        if(threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0 && blockIdx.x == 0 && blockIdx.y == 0) {
+            printf("dataIdx %d\r", dataIdx);
+        }
         // neuron corresponds to output wire
         const int outputDataPixelIdx = dataIdx * numColumns + columnIdx;
         const int outputNeuronIdx = outputDataPixelIdx * numNeuronPerColumn + neuronIdx;
@@ -389,7 +398,7 @@ void setup() {
     params.rate_capture = 1./2.;
     params.rate_backoff = 1./1024.;
     params.rate_search = 1./2.;
-    params.spikeThreshold = 400;
+    params.spikeThreshold = 2000;
     cudaError_t err = cudaGetLastError(); // clear any previous error
     if (err != cudaSuccess) {
         printf("Cuda error before memcpy to symbol: %s\n", cudaGetErrorString(err)); 
@@ -420,8 +429,16 @@ void launch_column(layerParams& params, int dataLength, char* spike_time_in) {
     cudaMalloc(&params.weights, sizeof(float) * params.nSynapsesPerNeuron 
                                             * params.nNeurons 
                                             * params.outputDim * params.outputDim);
+    cudaError_t err = cudaGetLastError(); // clear any previous error
+    if (err != cudaSuccess) {
+        printf("Cuda error after malloc weights: %s\n", cudaGetErrorString(err)); 
+    }
     
     cudaMalloc(&params.spike_time_out, sizeof(char) * params.nNeurons * params.outputDim * params.outputDim * dataLength);
+    err = cudaGetLastError(); // clear any previous error
+    if (err != cudaSuccess) {
+        printf("Cuda error after malloc spike_time_out: %s\n", cudaGetErrorString(err)); 
+    }
     int totalSharedSize = sizeof(int) * params.nNeurons + sizeof(int)*2;
     // column_kernel<<<dim3(params.outputDim, params.outputDim), 
     //                 dim3(params.nNeurons, 
@@ -432,7 +449,7 @@ void launch_column(layerParams& params, int dataLength, char* spike_time_in) {
     int batchSize = (params.rfSize + nXYthreads - 1)/nXYthreads;
     params.xBatchSize = batchSize;
     params.yBatchSize = batchSize;
-    cudaError_t err = cudaGetLastError(); // clear any previous error
+    err = cudaGetLastError(); // clear any previous error
     if (err != cudaSuccess) {
         printf("Cuda error before kernel launch: %s\n", cudaGetErrorString(err)); 
     }
@@ -444,7 +461,7 @@ void launch_column(layerParams& params, int dataLength, char* spike_time_in) {
     err = cudaGetLastError();
 
      if (err != cudaSuccess) {
-        printf("%s\n", cudaGetErrorString(err)); 
+        printf("Cuda error after kernel launch: %s\n", cudaGetErrorString(err)); 
         printf("outputDim %d, nNeurons %d, rfSize %d, nPrevChan %d\n", params.outputDim, params.nNeurons, params.rfSize, params.nPrevChan);
         printf("Total grid dim %d, total block dim %d\n", params.outputDim * params.outputDim, params.nNeurons * params.rfSize * params.rfSize * params.nPrevChan);
         printf("Total shared %d\n", totalSharedSize);

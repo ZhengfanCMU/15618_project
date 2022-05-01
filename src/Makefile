@@ -13,11 +13,11 @@ ARCH=$(shell uname | sed -e 's/-.*//g')
 
 OBJDIR=objs
 CXX=g++ -m64
-CXXFLAGS=-O0 -g -Wall -std=c++11
+CXXFLAGS=-O3 -g -Wall -std=c++11
 #-O3
 LDFLAGS=-L/usr/local/depot/cuda-10.2/lib64/ -lcudart
 NVCC=nvcc
-NVCCFLAGS=-O0 -g -m64 --gpu-architecture compute_61 -ccbin /usr/bin/gcc -std=c++11
+NVCCFLAGS=-O3 -g -m64 --gpu-architecture compute_61 -ccbin /usr/bin/gcc -std=c++11
 #-O3
 OBJS=$(OBJDIR)/main.o $(OBJDIR)/neuron.o
 
