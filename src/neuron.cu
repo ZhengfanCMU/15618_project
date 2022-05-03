@@ -246,7 +246,7 @@ __global__ void column_kernel(layerParams params, int dataLength, uint8_t* spike
 
     for (int dataIdx = 0; dataIdx < dataLength; ++dataIdx) {
         if(threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0 && blockIdx.x == 0 && blockIdx.y == 0) {
-            //printf("dataIdx %d\r", dataIdx);
+            printf("dataIdx %d\r", dataIdx);
         }
         if(threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
             earliestSpikingTime_shared = gammaLength;
@@ -335,12 +335,6 @@ __global__ void column_kernel(layerParams params, int dataLength, uint8_t* spike
             }
 
             __syncthreads();
-            // In case neuron reaches firing threshold in this cycle
-            if (neuronBodyPot_shared[neuronIdx] >= cuConstTNNParams.spikeThreshold) {
-                // used to test race conditions
-                assert(earliestSpikingTime_shared <= tickCycles);
-                break;
-            }
         }
 
         __syncthreads();
@@ -403,7 +397,7 @@ void setup() {
     params.rate_capture = 1./2.;
     params.rate_backoff = 1./2.;
     params.rate_search = 1./1024.;
-    params.spikeThreshold = 400;
+    params.spikeThreshold = 3000;
     cudaError_t err = cudaGetLastError(); // clear any previous error
     if (err != cudaSuccess) {
         printf("Cuda error before memcpy to symbol: %s\n", cudaGetErrorString(err)); 
