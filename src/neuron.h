@@ -16,13 +16,13 @@ struct layerParams {
 
     // Records layer data pointers
     // (device addresses)
-    char* spike_time_out;
+    uint8_t* spike_time_out;
     float* weights;
 };
 uint8_t* convertSpikesToHostImg(layerParams& params);
-void launch_load_MNIST(int nImgs, int nRows, int nCols, uint8_t* imgData, char* & spike_time_in);
-void copyLabelToDevice(int nLabels, uint8_t * labelData, char *& labels);
-void launch_column(layerParams& params, int dataLength, char* spike_time_in);
+void launch_load_MNIST(int nImgs, int nRows, int nCols, uint8_t* imgData, uint8_t* & spike_time_in);
+void copyLabelToDevice(int nLabels, uint8_t * labelData, uint8_t *& labels);
+void launch_column(layerParams& params, int dataLength, uint8_t* spike_time_in);
 void setup();
 uint8_t* convertToHostImg(layerParams& params);
 

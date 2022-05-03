@@ -37,7 +37,7 @@ __constant__ GlobalConstants cuConstTNNParams;
  * @param[in] cuMNISTdata MNIST data file loaded into cuda memory
  * @param[out] spike_time_in input spike time array to TNN layer in cuda memory
  */
-__global__ void MNIST_loader_kernel(const int pnThreshold, uint8_t * cuMNISTdata, char * spike_time_in) {
+__global__ void MNIST_loader_kernel(const int pnThreshold, uint8_t * cuMNISTdata, uint8_t * spike_time_in) {
     // sampleStart
     // numSamplesToConvert
     // rfSize
@@ -59,7 +59,7 @@ __global__ void MNIST_loader_kernel(const int pnThreshold, uint8_t * cuMNISTdata
 }
 
 
-void launch_load_MNIST(int nImgs, int nRows, int nCols, uint8_t* imgData, char* & spike_time_in) {
+void launch_load_MNIST(int nImgs, int nRows, int nCols, uint8_t* imgData, uint8_t* & spike_time_in) {
     // copy raw MNIST to device
     int nImageBytes = nImgs * nRows * nCols; // Each pixel is 1 byte.
     uint8_t * imgData_device = NULL;
@@ -68,7 +68,7 @@ void launch_load_MNIST(int nImgs, int nRows, int nCols, uint8_t* imgData, char* 
     cuerr = cudaMemcpy(imgData_device, imgData, nImageBytes, cudaMemcpyHostToDevice);
     assert(cuerr == cudaSuccess);
     int nChan = 2;
-    cuerr = cudaMalloc(&spike_time_in, sizeof(char) * nImageBytes * nChan);
+    cuerr = cudaMalloc(&spike_time_in, sizeof(uint8_t) * nImageBytes * nChan);
     assert(cuerr == cudaSuccess);
     // launch kernel to convert to spike time
     MNIST_loader_kernel<<<nImgs, dim3(nRows, nCols)>>>(UINT8_MAX/2, imgData_device, spike_time_in);
@@ -78,7 +78,7 @@ void launch_load_MNIST(int nImgs, int nRows, int nCols, uint8_t* imgData, char* 
         printf("Cuda error after MNIST_loader_kernel: %s\n", cudaGetErrorString(cuerr)); 
     }
 }
-void copyLabelToDevice(int nLabels, uint8_t * labelData, char *& labels) {
+void copyLabelToDevice(int nLabels, uint8_t * labelData, uint8_t *& labels) {
     cudaError_t cuerr = cudaMalloc(&labels, nLabels);
     assert(cuerr == cudaSuccess);
     cuerr = cudaMemcpy(labels, labelData, nLabels, cudaMemcpyHostToDevice);
@@ -114,11 +114,11 @@ void copyLabelToDevice(int nLabels, uint8_t * labelData, char *& labels) {
                 TODO: maybe change to k-WTA
  * @param[in]    dataLength number of images in the input and output
  */
-__global__ void column_kernel(layerParams params, int dataLength, char* spike_time_in) {
-    const int gammaLength = 1 << cuConstTNNParams.wres;
+__global__ void column_kernel(layerParams params, int dataLength, uint8_t* spike_time_in) {
+    const uint8_t gammaLength = 1 << cuConstTNNParams.wres;
 
     float* weights = params.weights;
-    char* spike_time_out = params.spike_time_out;
+    uint8_t* spike_time_out = params.spike_time_out;
     const int rfSize = params.rfSize;
     const int yBatchSize = params.yBatchSize;
     const int xBatchSize = params.xBatchSize;
@@ -159,15 +159,13 @@ __global__ void column_kernel(layerParams params, int dataLength, char* spike_ti
 
     // record the earliest spike in the column
     // might use an array of these for k-WTA
-    // __shared__ int earliestSpikingNeuron_shared;
-    // __shared__ int earliestSpikingTime_shared;
-    // int totalSharedSize = sizeof(int) * numNeuronPerColumn + sizeof(int)*2 + sizeof(bool) * numSynapsePerNeuron * numNeuronPerColumn;
     extern __shared__ int _AllShared[];
     // bool * const& synapseRNL_shared = (bool*) &_AllShared[sizeof(int) * numNeuronPerColumn + sizeof(int)*2];
     // int totalSharedSize = sizeof(int) * params.nNeurons + sizeof(int)*2;
     int * const& neuronBodyPot_shared = _AllShared;
     int & earliestSpikingNeuron_shared = _AllShared[numNeuronPerColumn];
     int & earliestSpikingTime_shared = _AllShared[numNeuronPerColumn + 1];
+    // uint8_t & synapseHitCount_shared = *(uint8_t*)&_AllShared[numNeuronPerColumn + 2];
     /*
     Per column:
     nNeuron
@@ -248,7 +246,11 @@ __global__ void column_kernel(layerParams params, int dataLength, char* spike_ti
 
     for (int dataIdx = 0; dataIdx < dataLength; ++dataIdx) {
         if(threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0 && blockIdx.x == 0 && blockIdx.y == 0) {
-            printf("dataIdx %d\r", dataIdx);
+            //printf("dataIdx %d\r", dataIdx);
+        }
+        if(threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
+            earliestSpikingTime_shared = gammaLength;
+            earliestSpikingNeuron_shared = 0;
         }
         // neuron corresponds to output wire
         const int outputDataPixelIdx = dataIdx * numColumns + columnIdx;
@@ -260,7 +262,6 @@ __global__ void column_kernel(layerParams params, int dataLength, char* spike_ti
             //spikeTimeOutNoInhibit[neuronIdx] = gammaLength;
             spike_time_out[outputNeuronIdx] = gammaLength;
         }
-        __syncthreads();
         
         // TODO use larger consts later
         int incStart[49];
@@ -293,10 +294,11 @@ __global__ void column_kernel(layerParams params, int dataLength, char* spike_ti
                 const int threadSynapseXIdx = rfXIdx - rfXIdxStart;
                 const int threadSynapseIdx = threadSynapseYIdx * xBatchSize + threadSynapseXIdx;
                 incStart[threadSynapseIdx] = spike_time_in[inputSpikeIdx];
-                incEnd[threadSynapseIdx] = spike_time_in[inputSpikeIdx] + weights[layerSynapseIdx];
+                incEnd[threadSynapseIdx] = spike_time_in[inputSpikeIdx] + static_cast<uint8_t>(weights[layerSynapseIdx]);
             }
         }
-        
+        __syncthreads();
+   
         // always runs for gammalength cycles
         for (int tickCycles = 0; tickCycles < gammaLength; ++tickCycles) {
             
@@ -341,14 +343,16 @@ __global__ void column_kernel(layerParams params, int dataLength, char* spike_ti
             }
         }
 
+        __syncthreads();
         // 1-WTA spike time out
         // reduce min for global spike time out
         // thread 0 write earliestSpikingTime_shared to output at earliestSpikingNeuron_shared
         // all the later spikes are inhibited by default
         if (threadIdx.y == 0 && threadIdx.z == 0 && neuronIdx == earliestSpikingNeuron_shared) {
-            spike_time_out[outputDataPixelIdx * numNeuronPerColumn + earliestSpikingNeuron_shared] = earliestSpikingTime_shared;
+            spike_time_out[outputNeuronIdx] = earliestSpikingTime_shared;
         }
-        
+
+        __syncthreads();
         // STDP and update weights
         for(int rfYIdx = rfYIdxStart; rfYIdx < rfYIdxEnd; ++rfYIdx) {
             for(int rfXIdx = rfXIdxStart; rfXIdx < rfXIdxEnd; ++rfXIdx) {
@@ -387,6 +391,7 @@ __global__ void column_kernel(layerParams params, int dataLength, char* spike_ti
                 weights[layerSynapseIdx] = weights[layerSynapseIdx] > (gammaLength - 1.) ? (gammaLength - 1.) : weights[layerSynapseIdx];
             }
         }
+        __syncthreads();
     }
 }
 
@@ -396,9 +401,9 @@ void setup() {
     // Fill in params
     params.wres = 3;
     params.rate_capture = 1./2.;
-    params.rate_backoff = 1./1024.;
-    params.rate_search = 1./2.;
-    params.spikeThreshold = 2000;
+    params.rate_backoff = 1./2.;
+    params.rate_search = 1./1024.;
+    params.spikeThreshold = 400;
     cudaError_t err = cudaGetLastError(); // clear any previous error
     if (err != cudaSuccess) {
         printf("Cuda error before memcpy to symbol: %s\n", cudaGetErrorString(err)); 
@@ -419,7 +424,7 @@ void setup() {
  * @param[in] dataLength how many sets are in there
  * @param[out] spike_time_out array for output spike time data (device pointer)
  */
-void launch_column(layerParams& params, int dataLength, char* spike_time_in) {
+void launch_column(layerParams& params, int dataLength, uint8_t* spike_time_in) {
     assert(params.stride == 1);
     params.outputDim = (params.inputDim - params.rfSize)/params.stride + 1;
     
@@ -434,7 +439,7 @@ void launch_column(layerParams& params, int dataLength, char* spike_time_in) {
         printf("Cuda error after malloc weights: %s\n", cudaGetErrorString(err)); 
     }
     
-    cudaMalloc(&params.spike_time_out, sizeof(char) * params.nNeurons * params.outputDim * params.outputDim * dataLength);
+    cudaMalloc(&params.spike_time_out, sizeof(uint8_t) * params.nNeurons * params.outputDim * params.outputDim * dataLength);
     err = cudaGetLastError(); // clear any previous error
     if (err != cudaSuccess) {
         printf("Cuda error after malloc spike_time_out: %s\n", cudaGetErrorString(err)); 
@@ -621,7 +626,7 @@ uint8_t* convertToHostImg(layerParams& params) {
 
     return weightsToImg_sequential(params);//host_img;
 }
-__global__  void spikesToImg (const char* spikes, uint8_t* device_img) {
+__global__  void spikesToImg (const uint8_t* spikes, uint8_t* device_img) {
     // const int columnIdx = blockIdx.y * gridDim.x + blockIdx.x; // for output
 
     // const int numNeuronPerColumn = blockDim.x;

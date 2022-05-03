@@ -97,7 +97,7 @@ void outputToBitmap(int x, int y, uint8_t* img, char* outputFile){
  * @param[in] input_file 
  * @param[out] spike_time_in 
  */
-void load_MNIST(const char* image_input_file, const char* label_input_file, char* & spike_time_in, char* & labels) {
+void load_MNIST(const char* image_input_file, const char* label_input_file, uint8_t* & spike_time_in, uint8_t* & labels) {
     const uint32_t IDX3_MAGIC = 0x803;
     const uint32_t IDX1_MAGIC = 0x801;
     // Load input MNIST dataset and cudaMemcpy
@@ -165,8 +165,8 @@ int main(int argc, char **argv) {
     using std::string;
     static_assert(sizeof(int) == 4, "int is not 32 bit");
     int dataLength = 10000;
-    char* spike_time_in = NULL;
-    char* labels = NULL;
+    uint8_t* spike_time_in = NULL;
+    uint8_t* labels = NULL;
     string dirpath = dirname(argv[0]);
     dirpath += string("/");
     string mnistImgPath = "data/train-images-idx3-ubyte";
