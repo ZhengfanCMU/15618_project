@@ -205,8 +205,8 @@ __global__ void column_kernel(layerParams params, int dataLength, uint8_t* spike
 
     // TODO: for stride 1 only, if supporting other strides, 
     // change this calculation/pass in input size as params
-    const int inputImgSizeX = gridDim.x + rfSize - 1;
-    const int inputImgSizeY = gridDim.y + rfSize - 1;
+    const int inputImgSizeX = params.inputDim;//gridDim.x + rfSize - 1;
+    const int inputImgSizeY = params.inputDim;//gridDim.y + rfSize - 1;
     const int numInputPixels = inputImgSizeX * inputImgSizeY;
 
     // Actual kernal launch parameters for now:
@@ -270,8 +270,8 @@ __global__ void column_kernel(layerParams params, int dataLength, uint8_t* spike
         }
         
         // TODO use larger consts later
-        int incStart[49];
-        int incEnd[49];
+        int incStart[100];
+        int incEnd[100];
         // Loop through thread local synapses to initialize incStart and incEnd
         for(int rfYIdx = rfYIdxStart; rfYIdx < rfYIdxEnd; ++rfYIdx) {
             const int threadSynapseYIdx = rfYIdx - rfYIdxStart;
@@ -301,6 +301,15 @@ __global__ void column_kernel(layerParams params, int dataLength, uint8_t* spike
                 const int threadSynapseIdx = threadSynapseYIdx * xBatchSize + threadSynapseXIdx;
                 incStart[threadSynapseIdx] = spike_time_in[inputSpikeIdx];
                 incEnd[threadSynapseIdx] = spike_time_in[inputSpikeIdx] + static_cast<uint8_t>(weights[layerSynapseIdx]);
+                // weights:
+                // column0,0|rf0,0 |rf0,1 |rf0,2 |rf1,0 |rf1,1 |rf1,2 |rf2,0 |rf2,1 |rf2,2 |
+                //   neuron0|ch0ch1|ch0ch1|ch0ch1|ch0ch1|ch0ch1|ch0ch1|ch0ch1|ch0ch1|ch0ch1|
+                //   neuron1
+                //   ...
+                // column0,1
+                // if(threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
+                //     printf("Zidx %d, Xbatch %d, RfXIdx %d, ChanIdx %d, threadSynapseIdx %d\n", threadIdx.z, xBatchIdx, rfXIdx, chanIdx, threadSynapseIdx);
+                // }
             }
         }
         __syncthreads();
@@ -476,9 +485,17 @@ void launch_column(layerParams& params, int dataLength, uint8_t* spike_time_in) 
         printf("Cuda error before kernel launch: %s\n", cudaGetErrorString(err)); 
     }
     // nXYthreads from batch size: (params.rfSize + params.yBatchSize - 1) / params.yBatchSize
+    /*
+    int timesAccessedSize = params.nPrevChan * params.inputDim * params.inputDim * sizeof(int);
+    int * timesAccessed;
+    err = cudaMalloc(&timesAccessed, timesAccessedSize);
+    if(err != cudaSuccess) {
+        printf("Cuda error after amlloc timesAccessed: %s\n", cudaGetErrorString);
+    }*/
+    //cudaMemset(timesAccessed, 0, timesAccessedSize);
     column_kernel<<<dim3(params.outputDim, params.outputDim),
                     dim3(params.nNeurons, nXYthreads, nXYthreads * params.nPrevChan),
-                    totalSharedSize>>>(params, dataLength, spike_time_in);
+                    totalSharedSize>>>(params, dataLength, spike_time_in/*, timesAccessed*/);
     cudaDeviceSynchronize();
     err = cudaGetLastError();
 
@@ -489,6 +506,19 @@ void launch_column(layerParams& params, int dataLength, uint8_t* spike_time_in) 
         printf("Total shared %d\n", totalSharedSize);
      }
     cudaFree(spike_time_in);
+    /*
+    int * timesAccessed_host = (int *) malloc(timesAccessedSize);
+    cudaMemcpy(timesAccessed_host, timesAccessed, timesAccessedSize, cudaMemcpyDeviceToHost);
+    for(int i = 0; i<params.inputDim; ++i) {
+        for(int j = 0; j<params.inputDim; ++j) {
+            int pixelIdx = i*params.inputDim+j;
+            for(int k = 0; k<params.nPrevChan; ++k) {
+                printf("%d, ", timesAccessed_host[pixelIdx*params.nPrevChan + k]);
+            }
+            printf("\b\b; ");
+        }
+        printf("\n");
+    }*/
 }
 
 void cudaFreeHostWrap(void* ptr) {
