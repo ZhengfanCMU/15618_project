@@ -483,7 +483,7 @@ void launch_column(layerParams& params, int dataLength, uint8_t* spike_time_in) 
      if (err != cudaSuccess) {
         printf("Cuda error after kernel launch: %s\n", cudaGetErrorString(err)); 
         printf("outputDim %d, nNeurons %d, rfSize %d, nPrevChan %d\n", params.outputDim, params.nNeurons, params.rfSize, params.nPrevChan);
-        printf("Total grid dim %d, total block dim %d\n", params.outputDim * params.outputDim, params.nNeurons * params.rfSize * params.rfSize * params.nPrevChan);
+        printf("Total grid dim %d, total block dim %d\n", params.outputDim * params.outputDim, params.nNeurons * nXYthreads * nXYthreads * params.nPrevChan);
         printf("Total shared %d\n", totalSharedSize);
      }
     cudaFree(spike_time_in);
