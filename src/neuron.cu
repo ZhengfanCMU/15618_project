@@ -162,9 +162,9 @@ __global__ void column_kernel(layerParams params, int dataLength, uint8_t* spike
     extern __shared__ int _AllShared[];
     // bool * const& synapseRNL_shared = (bool*) &_AllShared[sizeof(int) * numNeuronPerColumn + sizeof(int)*2];
     // int totalSharedSize = sizeof(int) * params.nNeurons + sizeof(int)*2;
-    int * const& neuronBodyPot_shared = _AllShared;
-    int * const& neuronSpikeTime_shared = &_AllShared[numNeuronPerColumn];
-    int * const& neuronSpikePot_shared = &_AllShared[numNeuronPerColumn * 2];
+    int * const neuronBodyPot_shared = _AllShared;
+    int * const neuronSpikeTime_shared = &(_AllShared[numNeuronPerColumn]);
+    int * const neuronSpikePot_shared = &(_AllShared[numNeuronPerColumn * 2]);
     // int & earliestSpikingNeuron_shared = _AllShared[numNeuronPerColumn];
     // int & earliestSpikingTime_shared = _AllShared[numNeuronPerColumn + 1];
     // uint8_t & synapseHitCount_shared = *(uint8_t*)&_AllShared[numNeuronPerColumn + 2];
@@ -217,11 +217,11 @@ __global__ void column_kernel(layerParams params, int dataLength, uint8_t* spike
     const int chanIdx = threadIdx.z % nPrevChan;
 
     const int rfYIdxStart = yBatchIdx * yBatchSize;
-    int _rfYIdxEnd = (yBatchIdx + 1) * yBatchSize;
+    const int _rfYIdxEnd = (yBatchIdx + 1) * yBatchSize;
     const int rfYIdxEnd = _rfYIdxEnd < rfSize ? _rfYIdxEnd : rfSize;
 
     const int rfXIdxStart = xBatchIdx * xBatchSize;
-    int _rfXIdxEnd = (xBatchIdx + 1) * xBatchSize;
+    const int _rfXIdxEnd = (xBatchIdx + 1) * xBatchSize;
     const int rfXIdxEnd = _rfXIdxEnd < rfSize ? _rfXIdxEnd : rfSize;
 
     // 0 0 1 1 1 0 0 0
@@ -322,7 +322,8 @@ __global__ void column_kernel(layerParams params, int dataLength, uint8_t* spike
             __syncthreads();
                             
             if(threadIdx.y == 0 && threadIdx.z == 0) {            
-                if (neuronBodyPot_shared[neuronIdx] >= cuConstTNNParams.spikeThreshold) {
+                if (neuronBodyPot_shared[neuronIdx] >= cuConstTNNParams.spikeThreshold 
+                    && neuronSpikeTime_shared[neuronIdx] == gammaLength) { // if this neuron has not spiked in a previous tick
                     // neuronSpikingTime_shared[numNeuron];
                     // neuronSpikingBodyPot_shared[numNeuron];
                     // record the earliest spike in the column
@@ -335,10 +336,10 @@ __global__ void column_kernel(layerParams params, int dataLength, uint8_t* spike
                     //       but that's with the assumption that tickCycles is synced
                     // TODO: doublecheck if possible race condition among neurons affect correctness
                     //       e.g. if neurons are across multiple warps and they are at different tickCycles
-                    if (neuronSpikeTime_shared[neuronIdx] > tickCycles) {
+                    // if (earliestSpikingTime_shared > tickCycles) {
                         neuronSpikePot_shared[neuronIdx] = neuronBodyPot_shared[neuronIdx];
                         neuronSpikeTime_shared[neuronIdx] = tickCycles;
-                    }
+                    // }
                 }
             }
 
@@ -350,11 +351,11 @@ __global__ void column_kernel(layerParams params, int dataLength, uint8_t* spike
         // reduce min for global spike time out
         // thread 0 write earliestSpikingTime_shared to output at earliestSpikingNeuron_shared
         // all the later spikes are inhibited by default
-        int earliestSpikingNeuron_local = neuronIdx;
+        int earliestSpikingNeuron_local = 0;
         for(int crtNeuronIdx = 0; crtNeuronIdx < numNeuronPerColumn; ++crtNeuronIdx) {
             if (neuronSpikeTime_shared[crtNeuronIdx] < neuronSpikeTime_shared[earliestSpikingNeuron_local] ||
                 (neuronSpikeTime_shared[crtNeuronIdx] == neuronSpikeTime_shared[earliestSpikingNeuron_local] &&
-                     neuronSpikePot_shared[crtNeuronIdx] > neuronSpikePot_shared[earliestSpikingNeuron_local])) {
+                 neuronSpikePot_shared[crtNeuronIdx] > neuronSpikePot_shared[earliestSpikingNeuron_local])) {
                 earliestSpikingNeuron_local = crtNeuronIdx;
             }
         }
@@ -416,7 +417,7 @@ void setup() {
     params.rate_capture = 1./2.;
     params.rate_backoff = 1./2.;
     params.rate_search = 1./1024.;
-    params.spikeThreshold = 3000;
+    params.spikeThreshold = 400;
     cudaError_t err = cudaGetLastError(); // clear any previous error
     if (err != cudaSuccess) {
         printf("Cuda error before memcpy to symbol: %s\n", cudaGetErrorString(err)); 
@@ -465,6 +466,7 @@ void launch_column(layerParams& params, int dataLength, uint8_t* spike_time_in) 
     int totalSharedSize = sizeof(int) * params.nNeurons * 3;
     // int totalSharedSize = sizeof(int) * params.nNeurons + sizeof(int)*3;
     int nXYthreads = static_cast<int>(floor(sqrt(1024.0/params.nNeurons/params.nPrevChan)));
+    nXYthreads /= 2;
     if (nXYthreads < 1) assert(false && "nNeuron and nPrevChan not supported");
     int batchSize = (params.rfSize + nXYthreads - 1)/nXYthreads;
     params.xBatchSize = batchSize;
