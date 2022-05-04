@@ -151,14 +151,17 @@ void load_MNIST(const char* image_input_file, const char* label_input_file, uint
     assert(elemRead == 1);
     nLabels = ntohl(nLabels);
 
-    uint8_t * labelData = (uint8_t *)malloc(nLabels);
-    elemRead = fread(labelData, 1, nLabels, mnistLabelFile);
+
+    //uint8_t * labelData 
+    labels = (uint8_t *)malloc(nLabels);
+    elemRead = fread(labels /*labelData*/, 1, nLabels, mnistLabelFile);
     assert(elemRead == (size_t)nLabels);
     assert(assertAtFileEnd(mnistLabelFile));
     fclose(mnistLabelFile);
-
+/*
     copyLabelToDevice(nLabels, labelData, labels);
-    free(labelData);
+    free(labelData);*/
+    
 }
 
 int main(int argc, char **argv) {
@@ -178,11 +181,21 @@ int main(int argc, char **argv) {
     load_MNIST((dirpath+mnistImgPath).c_str(), (dirpath+mnistLabelPath).c_str(), spike_time_in, labels); // perform parallel load
     layers[0].outputDim = 28;
     layers[0].nNeurons = 12;
+    layers[0].stdpEn = true;
     // layers[0].spike_time_out = spike_time_in;
     // outputToBitmap(28*12, 28*2, convertSpikesToHostImg(layers[0]), "mnistSpikeDirect3.bmp");
     launch_column(layers[0], dataLength, spike_time_in);
+    cudaFreeHostWrap(layers[0].spike_time_out);
+
     int outputxsize = layers[0].rfSize * layers[0].nNeurons;
     int outputysize = layers[0].rfSize * layers[0].nPrevChan * layers[0].outputDim * layers[0].outputDim;
     outputToBitmap(outputxsize, outputysize, convertToHostImg(layers[0]), "weights.bmp");
     
+    string mnistTestImgPath = "data/t10k-images-idx3-ubyte";
+    string mnistTestLabelPath = "data/t10k-labels-idx1-ubyte";
+    free(labels);
+    load_MNIST((dirpath+mnistTestImgPath).c_str(), (dirpath+mnistTestLabelPath).c_str(), spike_time_in, labels); // perform parallel load
+    launch_column(layers[0], dataLength, spike_time_in);
+    uint32_t* confMat;
+    getConfusionMat(layers[0], labels, confMat, dataLength);
 }

@@ -228,19 +228,21 @@ __global__ void column_kernel(layerParams params, int dataLength, uint8_t* spike
 
     // 0 1 3 5 
 
-    // TODO Initialize all the weights in batches
-    for(int rfYIdx = rfYIdxStart; rfYIdx < rfYIdxEnd; ++rfYIdx) {
-        for(int rfXIdx = rfXIdxStart; rfXIdx < rfXIdxEnd; ++rfXIdx) {
-            const int rfPixelIdx = rfSize * rfYIdx + rfXIdx;
-            // for indexing into neuron local synapse
-            const int neuronSynapseIdx = rfPixelIdx * nPrevChan + chanIdx;
-            // for indexing into column local synapse
-            const int columnSynapseIdx = neuronIdx * numSynapsePerNeuron + neuronSynapseIdx;
-            // for indexing into layer synpase weights
-            const int layerSynapseIdx = numNeuronPerColumn * numSynapsePerNeuron * columnIdx + columnSynapseIdx;
-            // half initialization for now
-            weights[layerSynapseIdx] = (gammaLength - 1.) / 2;
-            // TODO implement a choice of random initialization
+    // Initialize all the weights in batches
+    if (params.stdpEn) {
+        for(int rfYIdx = rfYIdxStart; rfYIdx < rfYIdxEnd; ++rfYIdx) {
+            for(int rfXIdx = rfXIdxStart; rfXIdx < rfXIdxEnd; ++rfXIdx) {
+                const int rfPixelIdx = rfSize * rfYIdx + rfXIdx;
+                // for indexing into neuron local synapse
+                const int neuronSynapseIdx = rfPixelIdx * nPrevChan + chanIdx;
+                // for indexing into column local synapse
+                const int columnSynapseIdx = neuronIdx * numSynapsePerNeuron + neuronSynapseIdx;
+                // for indexing into layer synpase weights
+                const int layerSynapseIdx = numNeuronPerColumn * numSynapsePerNeuron * columnIdx + columnSynapseIdx;
+                // half initialization for now
+                weights[layerSynapseIdx] = (gammaLength - 1.) / 2;
+                // TODO implement a choice of random initialization
+            }
         }
     }
 
@@ -348,6 +350,9 @@ __global__ void column_kernel(layerParams params, int dataLength, uint8_t* spike
 
         __syncthreads();
         // STDP and update weights
+        if (!params.stdpEn) {
+            continue;
+        }
         for(int rfYIdx = rfYIdxStart; rfYIdx < rfYIdxEnd; ++rfYIdx) {
             for(int rfXIdx = rfXIdxStart; rfXIdx < rfXIdxEnd; ++rfXIdx) {
                 const int spikeTimeInputX = blockIdx.x + rfXIdx;
@@ -465,6 +470,11 @@ void launch_column(layerParams& params, int dataLength, uint8_t* spike_time_in) 
         printf("Total grid dim %d, total block dim %d\n", params.outputDim * params.outputDim, params.nNeurons * params.rfSize * params.rfSize * params.nPrevChan);
         printf("Total shared %d\n", totalSharedSize);
      }
+    cudaFree(spike_time_in);
+}
+
+void cudaFreeHostWrap(void* ptr) {
+    cudaFree(ptr);
 }
 
 // weights float -> weights uchar (* UINT8_MAX / gammaLength)
@@ -672,3 +682,49 @@ uint8_t* convertSpikesToHostImg(layerParams& params) {
     cudaFree(device_img);
     return host_img;
 }
+
+void getConfusionMat(layerParams& params, uint8_t* labels, uint32_t* & confMat, int dataLength) {
+// TODO build a confusion matrix: each row is a neuron, each column is a label
+//      for each input image, at most 1 neuron could spike, we will inc the confMat[labelIdx, neuronIdx]
+// TODO calculate purity and coverage
+//      coverage = sum(confMat) / numLabels
+//      purity = sum(max(entry in each row(same neuron))) / sum(confMat)
+    const int gammaLength = 1 << 3; // wres = 3
+    const int numClasses = 10; // 10 digits
+    int totalSpikes = 0;
+    confMat = (uint32_t*)calloc(params.nNeurons*numClasses, sizeof(uint32_t));
+    size_t spikeTimeOutLength = params.nNeurons* params.outputDim * params.outputDim * dataLength;
+    uint8_t * hostSpikeTimeOut = (uint8_t*)malloc(spikeTimeOutLength);
+    cudaMemcpy(hostSpikeTimeOut, params.spike_time_out, spikeTimeOutLength, cudaMemcpyDeviceToHost);
+    for (int dataIdx = 0; dataIdx < dataLength; ++dataIdx) {
+        int correctLabel = labels[dataIdx];
+        int spikingNeuronIdx = -1; // use negative number to represent no spikes
+        for (int neuronIdx = 0; neuronIdx < params.nNeurons; ++neuronIdx) {
+            if (hostSpikeTimeOut[dataIdx * params.nNeurons + neuronIdx] < gammaLength) {
+                spikingNeuronIdx = neuronIdx;
+                break;
+            }
+        }
+        if (spikingNeuronIdx >= 0) { // has spike
+            ++confMat[spikingNeuronIdx * numClasses + correctLabel];
+            ++totalSpikes;
+        }
+    }
+    float purity = 0;
+    for (int neuronIdx = 0; neuronIdx < params.nNeurons; ++neuronIdx) {
+        // int maxClass = 0;
+        int maxCount = 0;
+        for (int classIdx = 0; classIdx < numClasses; ++classIdx) {
+            if (confMat[neuronIdx * numClasses + classIdx] > maxCount) {
+                // maxClass = classIdx;
+                maxCount = confMat[neuronIdx * numClasses + classIdx];
+            }
+        }
+        purity += maxCount;
+    }
+    purity /= static_cast<float>(totalSpikes);
+    float coverage = static_cast<float>(totalSpikes) / dataLength;
+    printf("purity: %f\n", purity);
+    printf("coverage: %f\n", coverage);
+}
+

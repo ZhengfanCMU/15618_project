@@ -18,11 +18,16 @@ struct layerParams {
     // (device addresses)
     uint8_t* spike_time_out;
     float* weights;
+
+    bool stdpEn; // enable means in training mode and weights will be reset
 };
 uint8_t* convertSpikesToHostImg(layerParams& params);
 void launch_load_MNIST(int nImgs, int nRows, int nCols, uint8_t* imgData, uint8_t* & spike_time_in);
 void copyLabelToDevice(int nLabels, uint8_t * labelData, uint8_t *& labels);
 void launch_column(layerParams& params, int dataLength, uint8_t* spike_time_in);
+void getConfusionMat(layerParams& params, uint8_t* labels, uint32_t* & confMat, int dataLength);
 void setup();
 uint8_t* convertToHostImg(layerParams& params);
 
+void cudaFreeHostWrap(void* ptr);
+void getConfusionMat(layerParams& params, uint8_t* labels, uint32_t* & confMat, int dataLength);
