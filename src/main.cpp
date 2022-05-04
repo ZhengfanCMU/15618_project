@@ -194,8 +194,15 @@ int main(int argc, char **argv) {
     string mnistTestImgPath = "data/t10k-images-idx3-ubyte";
     string mnistTestLabelPath = "data/t10k-labels-idx1-ubyte";
     free(labels);
+    layers[0].stdpEn = false;
     load_MNIST((dirpath+mnistTestImgPath).c_str(), (dirpath+mnistTestLabelPath).c_str(), spike_time_in, labels); // perform parallel load
     launch_column(layers[0], dataLength, spike_time_in);
     uint32_t* confMat;
     getConfusionMat(layers[0], labels, confMat, dataLength);
+    for(int neuronIdx = 0; neuronIdx < layers[0].nNeurons; ++neuronIdx) {
+        for(int classIdx = 0; classIdx < 10; ++classIdx){
+            printf("%d, ",confMat[neuronIdx * 10 + classIdx]);
+        }
+        printf("\n");
+    }
 }

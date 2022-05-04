@@ -303,22 +303,24 @@ __global__ void column_kernel(layerParams params, int dataLength, uint8_t* spike
    
         // always runs for gammalength cycles
         for (int tickCycles = 0; tickCycles < gammaLength; ++tickCycles) {
-            
+            int localBodyPot = 0;
             for(int rfYIdx = rfYIdxStart; rfYIdx < rfYIdxEnd; ++rfYIdx) {
                 for(int rfXIdx = rfXIdxStart; rfXIdx < rfXIdxEnd; ++rfXIdx) {
                     const int threadSynapseYIdx = rfYIdx - rfYIdxStart;
                     const int threadSynapseXIdx = rfXIdx - rfXIdxStart;
                     const int threadSynapseIdx = threadSynapseYIdx * xBatchSize + threadSynapseXIdx;
                     if (tickCycles >= incStart[threadSynapseIdx] && tickCycles < incEnd[threadSynapseIdx]) {
-                        // TODO perform thread local accumulate and do the atomic add outside the rf loop
-                        atomicAdd_block(&neuronBodyPot_shared[neuronIdx], 1);
+                        ++localBodyPot;
                     }
                 }
             }
+            atomicAdd_block(&neuronBodyPot_shared[neuronIdx], localBodyPot);
             __syncthreads();
                             
             if(threadIdx.y == 0 && threadIdx.z == 0) {            
                 if (neuronBodyPot_shared[neuronIdx] >= cuConstTNNParams.spikeThreshold) {
+                    // neuronSpikingTime_shared[numNeuron];
+                    // neuronSpikingBodyPot_shared[numNeuron];
                     // record the earliest spike in the column
                     // Only synapse 0 need to do this, but not adding if condition
                     // to avoid a conditional lane mask
@@ -430,20 +432,25 @@ void launch_column(layerParams& params, int dataLength, uint8_t* spike_time_in) 
     params.nSynapsesPerNeuron = params.rfSize * params.rfSize * params.nPrevChan;
     
     // weights are initialized in the kernel
-    cudaMalloc(&params.weights, sizeof(float) * params.nSynapsesPerNeuron 
-                                            * params.nNeurons 
-                                            * params.outputDim * params.outputDim);
-    cudaError_t err = cudaGetLastError(); // clear any previous error
-    if (err != cudaSuccess) {
-        printf("Cuda error after malloc weights: %s\n", cudaGetErrorString(err)); 
+    cudaError_t err;
+    if(params.stdpEn) {
+        cudaMalloc(&params.weights, sizeof(float) * params.nSynapsesPerNeuron 
+                                                * params.nNeurons 
+                                                * params.outputDim * params.outputDim);
+        err = cudaGetLastError(); // clear any previous error
+        if (err != cudaSuccess) {
+            printf("Cuda error after malloc weights: %s\n", cudaGetErrorString(err)); 
+        }
     }
-    
+    else {
+        assert(params.weights != NULL);
+    }
     cudaMalloc(&params.spike_time_out, sizeof(uint8_t) * params.nNeurons * params.outputDim * params.outputDim * dataLength);
     err = cudaGetLastError(); // clear any previous error
     if (err != cudaSuccess) {
         printf("Cuda error after malloc spike_time_out: %s\n", cudaGetErrorString(err)); 
     }
-    int totalSharedSize = sizeof(int) * params.nNeurons + sizeof(int)*2;
+    int totalSharedSize = sizeof(int) * params.nNeurons + sizeof(int)*3;
     // column_kernel<<<dim3(params.outputDim, params.outputDim), 
     //                 dim3(params.nNeurons, 
     //                      params.rfSize, 
