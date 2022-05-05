@@ -9,7 +9,7 @@
 #include <cassert>
 #include <arpa/inet.h> // for endianness conversion
 #include <string>
-
+#include "CycleTimer.h"
 void printCudaInfo();
 
 // return GB/s
@@ -185,7 +185,10 @@ int main(int argc, char **argv) {
     // layers[0].stdpEn = true;
     // layers[0].spike_time_out = spike_time_in;
     // outputToBitmap(28*12, 28*2, convertSpikesToHostImg(layers[0]), "mnistSpikeDirect3.bmp");
+    double startSeconds = CycleTimer::currentSeconds();
     launch_column(layers[0], dataLength, spike_time_in);
+    double endSeconds = CycleTimer::currentSeconds();
+    printf("Training time: %lf\n", endSeconds - startSeconds);
     cudaFreeHostWrap(layers[0].spike_time_out);
 
     int outputxsize = layers[0].rfSize * layers[0].nNeurons;
@@ -197,7 +200,10 @@ int main(int argc, char **argv) {
     free(labels);
     layers[0].stdpEn = false;
     load_MNIST((dirpath+mnistTestImgPath).c_str(), (dirpath+mnistTestLabelPath).c_str(), spike_time_in, labels); // perform parallel load
+    startSeconds = CycleTimer::currentSeconds();
     launch_column(layers[0], dataLength, spike_time_in);
+    endSeconds = CycleTimer::currentSeconds();
+    printf("Testing time: %lf\n", endSeconds - startSeconds);
     uint32_t* confMat;
     getConfusionMat(layers[0], labels, confMat, dataLength);
     for(int neuronIdx = 0; neuronIdx < layers[0].nNeurons; ++neuronIdx) {
