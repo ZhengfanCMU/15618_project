@@ -475,7 +475,7 @@ void launch_column(layerParams& params, int dataLength, uint8_t* spike_time_in) 
     int totalSharedSize = sizeof(int) * params.nNeurons * 3;
     // int totalSharedSize = sizeof(int) * params.nNeurons + sizeof(int)*3;
     int nXYthreads = static_cast<int>(floor(sqrt(1024.0/params.nNeurons/params.nPrevChan)));
-    nXYthreads /= 2;
+    //nXYthreads /= 2;
     if (nXYthreads < 1) assert(false && "nNeuron and nPrevChan not supported");
     int batchSize = (params.rfSize + nXYthreads - 1)/nXYthreads;
     params.xBatchSize = batchSize;
