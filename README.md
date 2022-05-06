@@ -107,3 +107,7 @@ There is the limitation that the total number of synapse * neurons in a column i
 
 <!-- What do you plan to show at the poster session? Will it be a demo? Will it be a graph? -->
 For poster session, we plan to show a graph of error rates to show how fast our model can converge when variance happen in the input dataset. It is going to be a demo using MNIST dataset. It is also nice if we can have an image that shows the trained weights on each synapse to show what features are learned by our model. We would also want to compare our model against a baseline PyTorch model.
+
+## Final presentation video
+https://cmu.zoom.us/rec/share/33h2Hhoo31BW23P3OKVL_RgqR7nXoYd-Jv2g1NY1Pdwq7lSJ83A1EMF6Utlb3Dgc.COxloVOnCBvjWxuq
+Passcode: t0T5W=AQ
