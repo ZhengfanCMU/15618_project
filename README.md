@@ -10,7 +10,7 @@ We are going to build a Temporal Neural Network (TNN) simulator on GHC’s CUDA 
 
 The output function of a synapse in our model follows the Ramp-No-Leak (RNL) function. It does not immediately add the whole weight to the body potential of the neuron, but instead adds 1 to the body potential every clock cycle and stops after weight cycles.
 
-![RNL function](img/rnl.png)
+![RNL function](img/rnl_annotated.png)
 
 The weight on a synapse is trained according to the spike-timing dependent plasticity model (STDP). This means that if the synapse receives a spike before the neuron fires a spike in a gamma cycle, the weight is strengthened, otherwise weakened.
 
